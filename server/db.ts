@@ -495,12 +495,17 @@ export class MailboxDatabase {
     let count = 0;
     await this.client.exec('BEGIN IMMEDIATE');
     try {
-      await this.client
+      const inserted = await this.client
         .prepare(
           `INSERT INTO rate_limits (bucket_key, window_start, count) VALUES (?, ?, 1)
-           ON CONFLICT(bucket_key, window_start) DO UPDATE SET count = count + 1`,
+           ON CONFLICT(bucket_key, window_start) DO NOTHING`,
         )
         .run(bucketKey, windowStart);
+      if (Number(inserted.changes) === 0) {
+        await this.client
+          .prepare('UPDATE rate_limits SET count = count + 1 WHERE bucket_key = ? AND window_start = ?')
+          .run(bucketKey, windowStart);
+      }
       const row = await this.client
         .prepare('SELECT count FROM rate_limits WHERE bucket_key = ? AND window_start = ?')
         .get(bucketKey, windowStart);
