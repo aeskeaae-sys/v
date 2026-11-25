@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install
+        run: npm install --legacy-peer-deps
+      - name: Unit + integration tests
+        run: |
+          npx --yes tsx --test server/*.test.ts src/utils/*.test.ts server/integration.test.ts || \
+          node --experimental-strip-types --test server/parser.test.ts server/crypto.test.ts server/store.test.ts server/ssrf-dns.test.ts src/utils/format.test.ts server/integration.test.ts
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm install --legacy-peer-deps
+      - run: npx tsc --noEmit
+      - run: npm run build
