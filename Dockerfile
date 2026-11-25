@@ -17,11 +17,12 @@ COPY --from=build /app/scripts ./scripts
 COPY --from=build /app/server.ts ./server.ts
 COPY --from=build /app/worker.ts ./worker.ts
 COPY --from=build /app/tsconfig.json ./tsconfig.json
-RUN mkdir -p /data/backups && chown -R node:node /data
+COPY --from=build /app/docker-entrypoint.sh ./docker-entrypoint.sh
+RUN chmod +x ./docker-entrypoint.sh && mkdir -p /data/backups && chown -R node:node /data
 USER node
 ENV FLOWMAIL_DB_PATH=/data/mailbox.db
 VOLUME ["/data"]
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["npm", "run", "start"]
+ENTRYPOINT ["./docker-entrypoint.sh"]
