@@ -60,7 +60,7 @@ async function deliverWebhookRetry(job: QueuedJob): Promise<{ ok: boolean; error
     error = err instanceof Error ? err.message : 'Network error';
   }
 
-  store.recordWebhookDelivery({
+  await store.recordWebhookDelivery({
     id: crypto.randomUUID(),
     webhookId: p.webhookId ? requireString(p.webhookId) : null,
     inboxId: requireString(p.inboxId, 'global'),
@@ -82,11 +82,11 @@ async function processJob(job: QueuedJob): Promise<void> {
   if (job.type === 'webhook.retry') {
     const result = await deliverWebhookRetry(job);
     if (result.ok) {
-      store.database.completeJob(job.id);
+      await store.database.completeJob(job.id);
     } else {
       const delay = Math.min(60 * 2 ** job.attempts, 3600);
-      const outcome = store.database.failJob(job.id, result.error || 'Unknown error', delay);
-      store.recordActivity(
+      const outcome = await store.database.failJob(job.id, result.error || 'Unknown error', delay);
+      await store.recordActivity(
         'webhook:retry',
         `${outcome === 'dead' ? 'Webhook retry exhausted' : 'Webhook retry scheduled'} for ${requireString(job.payload.targetUrl)}`,
         asOptionalString(job.payload.inboxAddress),
@@ -99,41 +99,42 @@ async function processJob(job: QueuedJob): Promise<void> {
 
   if (job.type === 'mailbox.sync') {
     await store.syncAllLiveInboxes();
-    store.database.completeJob(job.id);
+    await store.database.completeJob(job.id);
     return;
   }
 
   if (job.type === 'retention.prune') {
-    const pruned = store.database.pruneRetention(store.getRetentionDays());
-    store.database.pruneExpiredSessions();
-    store.database.pruneRateLimits();
-    store.database.recoverStaleJobs();
-    store.recordActivity(
+    const retentionDays = await store.getRetentionDays();
+    const pruned = await store.database.pruneRetention(retentionDays);
+    await store.database.pruneExpiredSessions();
+    await store.database.pruneRateLimits();
+    await store.database.recoverStaleJobs();
+    await store.recordActivity(
       'system:maintenance',
       `Pruned ${pruned.deletedMessages} message(s) and ${pruned.deletedLogs} log(s)`,
       'system@relaybox.dev',
       undefined,
       'info',
     );
-    store.database.completeJob(job.id);
+    await store.database.completeJob(job.id);
     return;
   }
 
-  store.database.failJob(job.id, `Unknown job type: ${job.type}`, 300);
+  await store.database.failJob(job.id, `Unknown job type: ${job.type}`, 300);
 }
 
 async function processQueue(): Promise<void> {
-  const jobs = store.database.claimJobs(workerId, 4);
+  const jobs = await store.database.claimJobs(workerId, 4);
   for (const job of jobs) {
     if (stopped) break;
     try {
       await processJob(job);
     } catch (err) {
-      store.database.failJob(job.id, err instanceof Error ? err.message : 'Worker error', 60);
+      await store.database.failJob(job.id, err instanceof Error ? err.message : 'Worker error', 60);
     }
     processedJobs += 1;
   }
-  store.database.recordWorkerHeartbeat(workerId, processedJobs);
+  await store.database.recordWorkerHeartbeat(workerId, processedJobs);
 }
 
 async function startWorker(): Promise<void> {
@@ -145,11 +146,14 @@ async function startWorker(): Promise<void> {
     return;
   }
 
-  console.log(`[worker] ${workerId} started; migrations=${store.database.getMigrationCount()}`);
-  store.database.recordWorkerHeartbeat(workerId, 0);
+  await store.ready;
+  console.log(`[worker] ${workerId} started; migrations=${await store.database.getMigrationCount()}`);
+  await store.database.recordWorkerHeartbeat(workerId, 0);
 
   const queueTimer = setInterval(() => {
-    void processQueue();
+    void processQueue().catch((err: unknown) => {
+      console.error('[worker] queue processing failed:', err instanceof Error ? err.message : err);
+    });
   }, 2000);
   const syncTimer = setInterval(() => {
     void store.syncAllLiveInboxes().catch((err: unknown) => {
@@ -157,10 +161,15 @@ async function startWorker(): Promise<void> {
     });
   }, 60_000);
   const retentionTimer = setInterval(() => {
-    store.database.pruneRetention(store.getRetentionDays());
-    store.database.pruneExpiredSessions();
-    store.database.pruneRateLimits();
-    store.database.recoverStaleJobs();
+    void (async () => {
+      const retentionDays = await store.getRetentionDays();
+      await store.database.pruneRetention(retentionDays);
+      await store.database.pruneExpiredSessions();
+      await store.database.pruneRateLimits();
+      await store.database.recoverStaleJobs();
+    })().catch((err: unknown) => {
+      console.error('[worker] retention prune failed:', err instanceof Error ? err.message : err);
+    });
   }, 60 * 60 * 1000);
 
   const shutdown = (signal: string) => {
@@ -170,12 +179,14 @@ async function startWorker(): Promise<void> {
     clearInterval(queueTimer);
     clearInterval(syncTimer);
     clearInterval(retentionTimer);
-    process.exit(0);
+    void store.database.close().then(() => process.exit(0));
   };
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));
 
-  void processQueue();
+  void processQueue().catch((err: unknown) => {
+    console.error('[worker] initial queue processing failed:', err instanceof Error ? err.message : err);
+  });
 }
 
 void startWorker();

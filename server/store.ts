@@ -151,6 +151,10 @@ export class FlowMailStore {
     );
   }
 
+  get ready(): Promise<void> {
+    return this.database.ready;
+  }
+
   subscribe(listener: (event: StoreEvent) => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -172,13 +176,13 @@ export class FlowMailStore {
     }
   }
 
-  recordActivity(
+  async recordActivity(
     type: ActivityEvent['type'],
     summary: string,
     inboxAddress?: string,
     detail?: string,
     status: ActivityStatus = 'info',
-  ): ActivityEvent {
+  ): Promise<ActivityEvent> {
     const activity: ActivityEvent = {
       id: crypto.randomUUID(),
       type,
@@ -188,31 +192,31 @@ export class FlowMailStore {
       detail,
       timestamp: new Date().toISOString(),
     };
-    this.database.insertActivity(activity);
+    await this.database.insertActivity(activity);
     this.emit({ type: 'activity', activity });
     return activity;
   }
 
-  private pruneExpired(): void {
+  private async pruneExpired(): Promise<void> {
     const now = Date.now();
-    for (const inbox of this.database.listInboxes()) {
+    for (const inbox of await this.database.listInboxes()) {
       if (inbox.expiresAt && new Date(inbox.expiresAt).getTime() <= now) {
         if (inbox.credentials) {
           void deleteLiveMxAccount(inbox.credentials);
         }
-        this.database.deleteInbox(inbox.id);
+        await this.database.deleteInbox(inbox.id);
       }
     }
   }
 
-  listInboxes(): Inbox[] {
-    this.pruneExpired();
-    return this.database.listInboxes().map(toPublicInbox);
+  async listInboxes(): Promise<Inbox[]> {
+    await this.pruneExpired();
+    return (await this.database.listInboxes()).map(toPublicInbox);
   }
 
-  getInboxByIdOrAddress(idOrAddress: string): Inbox | null {
-    this.pruneExpired();
-    const stored = this.database.getInboxByIdOrAddress(idOrAddress);
+  async getInboxByIdOrAddress(idOrAddress: string): Promise<Inbox | null> {
+    await this.pruneExpired();
+    const stored = await this.database.getInboxByIdOrAddress(idOrAddress);
     return stored ? toPublicInbox(stored) : null;
   }
 
@@ -230,10 +234,10 @@ export class FlowMailStore {
     return out;
   }
 
-  private deliverInboxCredentialsEmail(
+  private async deliverInboxCredentialsEmail(
     stored: StoredInboxRecord,
     mailboxPassword: string,
-  ): EmailMessage {
+  ): Promise<EmailMessage> {
     const providerDesc =
       stored.provider === 'mail.tm'
         ? 'Live MX (Mail.tm)'
@@ -280,7 +284,7 @@ export class FlowMailStore {
   </div>
 </div>`.trim();
 
-    return this.ingestMessage({
+    return await this.ingestMessage({
       to: stored.address,
       from: 'security@relaybox.dev',
       fromName: 'RelayBox Mail Credentials',
@@ -292,7 +296,7 @@ export class FlowMailStore {
     });
   }
 
-  registerLiveMxInbox(
+  async registerLiveMxInbox(
     provisioned: ProvisionedLiveAccount,
     options: {
       ttl?: TtlPreset;
@@ -301,8 +305,8 @@ export class FlowMailStore {
       mxVerified?: boolean | null;
       deliverCredentialsEmail?: boolean;
     } = {},
-  ): Inbox {
-    this.pruneExpired();
+  ): Promise<Inbox> {
+    await this.pruneExpired();
     let webhookUrl: string | undefined;
     if (options.webhookUrl && options.webhookUrl.trim()) {
       const check = validateOutboundWebhookUrl(options.webhookUrl);
@@ -338,9 +342,9 @@ export class FlowMailStore {
       },
     };
 
-    this.database.upsertInbox(stored);
+    await this.database.upsertInbox(stored);
     const publicInbox = toPublicInbox(stored);
-    this.recordActivity(
+    await this.recordActivity(
       'inbox:created',
       `Provisioned live MX address ${stored.address}`,
       stored.address,
@@ -354,16 +358,16 @@ export class FlowMailStore {
       inbox: publicInbox,
     });
     if (options.deliverCredentialsEmail && provisioned.remotePassword) {
-      this.deliverInboxCredentialsEmail(stored, provisioned.remotePassword);
-      return this.getInboxByIdOrAddress(stored.id) ?? publicInbox;
+      await this.deliverInboxCredentialsEmail(stored, provisioned.remotePassword);
+      return (await this.getInboxByIdOrAddress(stored.id)) ?? publicInbox;
     }
     return publicInbox;
   }
 
-  createInbox(
+  async createInbox(
     input: CreateWebhookInboxInput & { mode?: InboxMode; deliverCredentialsEmail?: boolean } = {},
-  ): Inbox {
-    this.pruneExpired();
+  ): Promise<Inbox> {
+    await this.pruneExpired();
     const domainInput = (input.domain || WEBHOOK_DOMAINS[0]).trim().toLowerCase();
     if (!isWebhookDomain(domainInput)) {
       throw new Error(
@@ -384,7 +388,7 @@ export class FlowMailStore {
     }
 
     let address = `${localPart}@${domainInput}`;
-    const existing = this.database.getInboxByIdOrAddress(address);
+    const existing = await this.database.getInboxByIdOrAddress(address);
     if (existing && !input.prefix) {
       localPart = generateRandomLocalPart('inbox');
       address = `${localPart}@${domainInput}`;
@@ -423,9 +427,9 @@ export class FlowMailStore {
       webhookUrl,
     };
 
-    this.database.upsertInbox(stored);
+    await this.database.upsertInbox(stored);
     const publicInbox = toPublicInbox(stored);
-    this.recordActivity(
+    await this.recordActivity(
       'inbox:created',
       `Created ${provider.toUpperCase()} inbox ${stored.address}`,
       stored.address,
@@ -440,13 +444,13 @@ export class FlowMailStore {
     });
     if (input.deliverCredentialsEmail) {
       const mailboxPassword = this.generateMailboxPassword();
-      this.deliverInboxCredentialsEmail(stored, mailboxPassword);
-      return this.getInboxByIdOrAddress(stored.id) ?? publicInbox;
+      await this.deliverInboxCredentialsEmail(stored, mailboxPassword);
+      return (await this.getInboxByIdOrAddress(stored.id)) ?? publicInbox;
     }
     return publicInbox;
   }
 
-  createAliasInbox(input: {
+  async createAliasInbox(input: {
     baseEmail?: string;
     domain?: string;
     provider?: 'gmail-alias' | 'outlook-alias';
@@ -456,8 +460,8 @@ export class FlowMailStore {
     label?: string;
     webhookUrl?: string;
     deliverCredentialsEmail?: boolean;
-  }): Inbox {
-    this.pruneExpired();
+  }): Promise<Inbox> {
+    await this.pruneExpired();
     const rawBaseInput = (input.baseEmail || '').trim();
     const parsed = rawBaseInput ? normalizeEmailAddress(rawBaseInput) : null;
     if (rawBaseInput && !parsed) {
@@ -528,7 +532,7 @@ export class FlowMailStore {
         if (dotsPlaced === 0) {
           candidate = `${chars[0]}.${chars.slice(1).join('')}`;
         }
-        if (!this.database.getInboxByIdOrAddress(`${candidate}@${domain}`)) {
+        if (!(await this.database.getInboxByIdOrAddress(`${candidate}@${domain}`))) {
           localPart = candidate;
           break;
         }
@@ -546,7 +550,7 @@ export class FlowMailStore {
       if (hasExplicitBase) {
         const tag = customTag || `rb${crypto.randomBytes(2).toString('hex')}`;
         localPart = `${rawBaseLocal}+${tag}`;
-        if (this.database.getInboxByIdOrAddress(`${localPart}@${domain}`)) {
+        if (await this.database.getInboxByIdOrAddress(`${localPart}@${domain}`)) {
           if (customTag) {
             throw new Error(`ที่อยู่ "${localPart}@${domain}" มีอยู่ในระบบแล้ว`);
           }
@@ -554,7 +558,7 @@ export class FlowMailStore {
         }
       } else {
         localPart = customTag ? `${rawBaseLocal}+${customTag}` : rawBaseLocal;
-        if (this.database.getInboxByIdOrAddress(`${localPart}@${domain}`)) {
+        if (await this.database.getInboxByIdOrAddress(`${localPart}@${domain}`)) {
           const freshLocal = `rb${crypto.randomBytes(4).toString('hex')}`;
           localPart = customTag ? `${freshLocal}+${customTag}` : freshLocal;
         }
@@ -562,7 +566,7 @@ export class FlowMailStore {
     }
 
     const address = `${localPart}@${domain}`;
-    if (this.database.getInboxByIdOrAddress(address)) {
+    if (await this.database.getInboxByIdOrAddress(address)) {
       throw new Error(`ที่อยู่ "${address}" มีอยู่ในระบบแล้ว`);
     }
 
@@ -600,9 +604,9 @@ export class FlowMailStore {
       webhookUrl,
     };
 
-    this.database.upsertInbox(stored);
+    await this.database.upsertInbox(stored);
     const publicInbox = toPublicInbox(stored);
-    this.recordActivity(
+    await this.recordActivity(
       'inbox:created',
       `Created ${provider === 'outlook-alias' ? 'Outlook' : 'Gmail'} alias ${stored.address}`,
       stored.address,
@@ -617,22 +621,22 @@ export class FlowMailStore {
     });
     if (input.deliverCredentialsEmail) {
       const mailboxPassword = this.generateMailboxPassword();
-      this.deliverInboxCredentialsEmail(stored, mailboxPassword);
-      return this.getInboxByIdOrAddress(stored.id) ?? publicInbox;
+      await this.deliverInboxCredentialsEmail(stored, mailboxPassword);
+      return (await this.getInboxByIdOrAddress(stored.id)) ?? publicInbox;
     }
     return publicInbox;
   }
 
-  markInboxSynced(idOrAddress: string, addedCount = 0): Inbox | null {
-    const stored = this.database.getInboxByIdOrAddress(idOrAddress);
+  async markInboxSynced(idOrAddress: string, addedCount = 0): Promise<Inbox | null> {
+    const stored = await this.database.getInboxByIdOrAddress(idOrAddress);
     if (!stored) return null;
     stored.lastSyncedAt = new Date().toISOString();
     stored.syncError = null;
     stored.status = 'active';
-    this.database.upsertInbox(stored);
-    const publicInbox = this.getInboxByIdOrAddress(stored.id) ?? toPublicInbox(stored);
+    await this.database.upsertInbox(stored);
+    const publicInbox = (await this.getInboxByIdOrAddress(stored.id)) ?? toPublicInbox(stored);
     if (addedCount > 0) {
-      this.recordActivity(
+      await this.recordActivity(
         'inbox:synced',
         `Synced ${addedCount} real message(s) for ${stored.address}`,
         stored.address,
@@ -649,7 +653,7 @@ export class FlowMailStore {
     return publicInbox;
   }
 
-  updateInbox(
+  async updateInbox(
     idOrAddress: string,
     patch: {
       label?: string;
@@ -658,8 +662,8 @@ export class FlowMailStore {
       ttl?: TtlPreset;
       mxVerified?: boolean | null;
     },
-  ): Inbox | null {
-    const stored = this.database.getInboxByIdOrAddress(idOrAddress);
+  ): Promise<Inbox | null> {
+    const stored = await this.database.getInboxByIdOrAddress(idOrAddress);
     if (!stored) return null;
 
     if (typeof patch.label === 'string' && patch.label.trim()) {
@@ -685,9 +689,9 @@ export class FlowMailStore {
       stored.mxVerified = patch.mxVerified;
     }
 
-    this.database.upsertInbox(stored);
+    await this.database.upsertInbox(stored);
     const publicInbox = toPublicInbox(stored);
-    this.recordActivity(
+    await this.recordActivity(
       'inbox:updated',
       `Updated mailbox settings for ${stored.address}`,
       stored.address,
@@ -703,14 +707,14 @@ export class FlowMailStore {
     return publicInbox;
   }
 
-  deleteInbox(idOrAddress: string): boolean {
-    const stored = this.database.getInboxByIdOrAddress(idOrAddress);
+  async deleteInbox(idOrAddress: string): Promise<boolean> {
+    const stored = await this.database.getInboxByIdOrAddress(idOrAddress);
     if (!stored) return false;
     if (stored.credentials) {
       void deleteLiveMxAccount(stored.credentials);
     }
-    this.database.deleteInbox(stored.id);
-    this.recordActivity(
+    await this.database.deleteInbox(stored.id);
+    await this.recordActivity(
       'inbox:deleted',
       `Deleted inbox ${stored.address}`,
       stored.address,
@@ -721,17 +725,17 @@ export class FlowMailStore {
     return true;
   }
 
-  clearInboxMessages(idOrAddress: string): number {
-    const stored = this.database.getInboxByIdOrAddress(idOrAddress);
+  async clearInboxMessages(idOrAddress: string): Promise<number> {
+    const stored = await this.database.getInboxByIdOrAddress(idOrAddress);
     if (!stored) return 0;
-    const msgs = this.database.queryMessages({ inboxId: stored.id, folder: 'all', limit: 500 }).messages;
+    const msgs = (await this.database.queryMessages({ inboxId: stored.id, folder: 'all', limit: 500 })).messages;
     for (const msg of msgs) {
       if (msg.remoteId && stored.credentials) {
         void deleteLiveMxMessage(msg.remoteId, stored.credentials);
       }
     }
-    const deleted = this.database.clearInboxMessages(stored.id);
-    const updatedInbox = this.getInboxByIdOrAddress(stored.id);
+    const deleted = await this.database.clearInboxMessages(stored.id);
+    const updatedInbox = await this.getInboxByIdOrAddress(stored.id);
     this.emit({
       type: 'inbox:cleared',
       inboxId: stored.id,
@@ -741,7 +745,7 @@ export class FlowMailStore {
     return deleted;
   }
 
-  updateInboxWebhook(idOrAddress: string, rawUrl: string | null): Inbox | null {
+  async updateInboxWebhook(idOrAddress: string, rawUrl: string | null): Promise<Inbox | null> {
     return this.updateInbox(idOrAddress, { webhookUrl: rawUrl });
   }
 
@@ -749,7 +753,7 @@ export class FlowMailStore {
     idOrAddress: string,
     options?: { force?: boolean },
   ): Promise<{ inbox: Inbox; added: EmailMessage[] }> {
-    const stored = this.database.getInboxByIdOrAddress(idOrAddress);
+    const stored = await this.database.getInboxByIdOrAddress(idOrAddress);
     if (!stored) {
       throw new Error(`Inbox "${idOrAddress}" not found.`);
     }
@@ -780,7 +784,7 @@ export class FlowMailStore {
     this.syncingInboxes.add(stored.id);
     this.lastInboxSyncAttemptMs.set(stored.id, now);
     try {
-      const knownRemoteIds = this.database.listKnownRemoteIds(stored.id);
+      const knownRemoteIds = await this.database.listKnownRemoteIds(stored.id);
       const mxCheck = await checkDomainMxRecords(stored.domain).catch(() => null);
       if (mxCheck) {
         stored.mxVerified = mxCheck.mxVerified;
@@ -798,20 +802,20 @@ export class FlowMailStore {
       stored.lastSyncedAt = new Date().toISOString();
       stored.syncError = null;
       stored.status = 'active';
-      this.database.upsertInbox(stored);
+      await this.database.upsertInbox(stored);
 
       const added: EmailMessage[] = [];
       for (const payload of payloads) {
-        const msg = this.ingestMessage(payload);
+        const msg = await this.ingestMessage(payload);
         added.push(msg);
       }
 
       this.lastSyncAt = stored.lastSyncedAt;
       this.lastSyncError = null;
 
-      const publicInbox = this.getInboxByIdOrAddress(stored.id) ?? toPublicInbox(stored);
+      const publicInbox = (await this.getInboxByIdOrAddress(stored.id)) ?? toPublicInbox(stored);
       if (added.length > 0) {
-        this.recordActivity(
+        await this.recordActivity(
           'inbox:synced',
           `Synced ${added.length} new message(s) for ${stored.address}`,
           stored.address,
@@ -832,9 +836,9 @@ export class FlowMailStore {
         const msg = `ผู้ให้บริการ Live MX จำกัดความถี่ชั่วคราว (429) — จะซิงก์ใหม่อัตโนมัติใน ${err.retryAfterSec} วินาที`;
         stored.syncError = msg;
         stored.status = 'active';
-        this.database.upsertInbox(stored);
+        await this.database.upsertInbox(stored);
         this.lastSyncError = msg;
-        const publicInbox = this.getInboxByIdOrAddress(stored.id) ?? toPublicInbox(stored);
+        const publicInbox = (await this.getInboxByIdOrAddress(stored.id)) ?? toPublicInbox(stored);
         this.emit({
           type: 'inbox:synced',
           inboxId: stored.id,
@@ -847,10 +851,10 @@ export class FlowMailStore {
       const msg = err instanceof Error ? err.message : 'Sync failed';
       stored.syncError = msg;
       stored.status = 'error';
-      this.database.upsertInbox(stored);
+      await this.database.upsertInbox(stored);
       this.lastSyncError = msg;
-      this.recordActivity('inbox:synced', `Sync failed for ${stored.address}`, stored.address, msg, 'error');
-      const publicInbox = this.getInboxByIdOrAddress(stored.id) ?? toPublicInbox(stored);
+      await this.recordActivity('inbox:synced', `Sync failed for ${stored.address}`, stored.address, msg, 'error');
+      const publicInbox = (await this.getInboxByIdOrAddress(stored.id)) ?? toPublicInbox(stored);
       this.emit({
         type: 'inbox:synced',
         inboxId: stored.id,
@@ -869,9 +873,8 @@ export class FlowMailStore {
 
     this.syncAllInFlight = true;
     try {
-      this.pruneExpired();
-      const liveInboxes = this.database
-        .listInboxes()
+      await this.pruneExpired();
+      const liveInboxes = (await this.database.listInboxes())
         .filter((i) => i.mode === 'live-mx' && Boolean(i.credentials) && i.status !== 'paused');
 
       for (let i = 0; i < liveInboxes.length; i++) {
@@ -891,14 +894,14 @@ export class FlowMailStore {
     }
   }
 
-  ingestMessage(payload: IngestEmailPayload): EmailMessage {
-    this.pruneExpired();
+  async ingestMessage(payload: IngestEmailPayload): Promise<EmailMessage> {
+    await this.pruneExpired();
     const parsedTo = normalizeEmailAddress(payload.to);
     if (!parsedTo) {
       throw new Error('Invalid recipient "to" email address.');
     }
 
-    let inbox = this.database.getInboxByIdOrAddress(parsedTo.full);
+    let inbox = await this.database.getInboxByIdOrAddress(parsedTo.full);
     if (!inbox) {
       if (payload.autoCreateInbox) {
         if (!isWebhookDomain(parsedTo.domain)) {
@@ -906,14 +909,14 @@ export class FlowMailStore {
             `Cannot auto-create webhook inbox for domain "${parsedTo.domain}".`,
           );
         }
-        const created = this.createInbox({
+        const created = await this.createInbox({
           prefix: parsedTo.localPart,
           domain: parsedTo.domain,
           ttl: '24h',
           label: `Inbound (${parsedTo.localPart})`,
           provider: payload.source === 'smtp' ? 'smtp' : 'webhook',
         });
-        inbox = this.database.getInboxByIdOrAddress(created.id);
+        inbox = await this.database.getInboxByIdOrAddress(created.id);
       }
       if (!inbox) {
         throw new Error(
@@ -935,7 +938,7 @@ export class FlowMailStore {
         : stripHtmlToText(html);
 
     const contentHash = computeMessageContentHash(inbox.id, fromAddr, subject, text);
-    const duplicate = this.database.findDuplicateMessage(inbox.id, payload.remoteId, contentHash);
+    const duplicate = await this.database.findDuplicateMessage(inbox.id, payload.remoteId, contentHash);
     if (duplicate) {
       return duplicate;
     }
@@ -1002,7 +1005,7 @@ export class FlowMailStore {
       deletedAt: null,
     };
 
-    this.database.insertMessage(message);
+    await this.database.insertMessage(message);
 
     if (folder === 'inbox' || folder === 'spam') {
       const maskedDetail = extracted.primaryOtp
@@ -1013,7 +1016,7 @@ export class FlowMailStore {
             ? `Classified as Spam (score ${spamCheck.score})`
             : undefined;
 
-      this.recordActivity(
+      await this.recordActivity(
         'email:received',
         `${subject} -> ${inbox.address}`,
         inbox.address,
@@ -1022,7 +1025,7 @@ export class FlowMailStore {
       );
 
       if (extracted.otpCodes.length > 0) {
-        this.recordActivity(
+        await this.recordActivity(
           'otp:detected',
           `Detected ${extracted.otpCodes.length} verification code(s) in "${subject}"`,
           inbox.address,
@@ -1032,7 +1035,7 @@ export class FlowMailStore {
       }
     }
 
-    const updatedInbox = this.getInboxByIdOrAddress(inbox.id) ?? toPublicInbox(inbox);
+    const updatedInbox = (await this.getInboxByIdOrAddress(inbox.id)) ?? toPublicInbox(inbox);
     this.emit({
       type: 'email:received',
       inboxId: inbox.id,
@@ -1042,20 +1045,20 @@ export class FlowMailStore {
     });
 
     if (folder === 'inbox') {
-      this.resolveWaiters(message);
+      await this.resolveWaiters(message);
     }
     return message;
   }
 
-  saveDraftOrSentMessage(input: {
+  async saveDraftOrSentMessage(input: {
     inboxIdOrAddress: string;
     to: string;
     subject: string;
     text: string;
     html?: string;
     mode: 'drafts' | 'sent';
-  }): EmailMessage {
-    const senderInbox = this.database.getInboxByIdOrAddress(input.inboxIdOrAddress);
+  }): Promise<EmailMessage> {
+    const senderInbox = await this.database.getInboxByIdOrAddress(input.inboxIdOrAddress);
     if (!senderInbox) throw new Error('Sender inbox not found.');
 
     const parsedRecipient = normalizeEmailAddress(input.to);
@@ -1102,10 +1105,10 @@ export class FlowMailStore {
       deletedAt: null,
     };
 
-    this.database.insertMessage(message);
+    await this.database.insertMessage(message);
 
     if (input.mode === 'sent') {
-      this.recordActivity(
+      await this.recordActivity(
         'email:sent',
         `Sent message "${subject}" to ${message.to}`,
         senderInbox.address,
@@ -1113,8 +1116,8 @@ export class FlowMailStore {
         'success',
       );
       // If recipient is a local inbox on this RelayBox instance, deliver internally!
-      if (parsedRecipient && this.database.getInboxByIdOrAddress(parsedRecipient.full)) {
-        this.ingestMessage({
+      if (parsedRecipient && (await this.database.getInboxByIdOrAddress(parsedRecipient.full))) {
+        await this.ingestMessage({
           to: parsedRecipient.full,
           from: senderInbox.address,
           fromName: senderInbox.label,
@@ -1126,7 +1129,7 @@ export class FlowMailStore {
       }
     }
 
-    const updatedInbox = this.getInboxByIdOrAddress(senderInbox.id) ?? toPublicInbox(senderInbox);
+    const updatedInbox = (await this.getInboxByIdOrAddress(senderInbox.id)) ?? toPublicInbox(senderInbox);
     this.emit({
       type: 'email:received',
       inboxId: senderInbox.id,
@@ -1137,10 +1140,10 @@ export class FlowMailStore {
     return message;
   }
 
-  listMessages(idOrAddress: string, filters: MessageFilterOptions = {}): EmailMessage[] {
-    const inbox = this.database.getInboxByIdOrAddress(idOrAddress);
+  async listMessages(idOrAddress: string, filters: MessageFilterOptions = {}): Promise<EmailMessage[]> {
+    const inbox = await this.database.getInboxByIdOrAddress(idOrAddress);
     if (!inbox) return [];
-    return this.database.queryMessages({
+    return (await this.database.queryMessages({
       inboxId: inbox.id,
       folder: filters.folder,
       subject: filters.subject,
@@ -1151,27 +1154,27 @@ export class FlowMailStore {
       query: filters.query,
       limit: filters.limit,
       offset: filters.offset,
-    }).messages;
+    })).messages;
   }
 
-  queryMessagesPaginated(params: MessageQueryParams): { messages: EmailMessage[]; total: number } {
+  async queryMessagesPaginated(params: MessageQueryParams): Promise<{ messages: EmailMessage[]; total: number }> {
     return this.database.queryMessages(params);
   }
 
-  getLatestMessage(idOrAddress: string, filters: MessageFilterOptions = {}): EmailMessage | null {
-    const list = this.listMessages(idOrAddress, { ...filters, limit: 1 });
+  async getLatestMessage(idOrAddress: string, filters: MessageFilterOptions = {}): Promise<EmailMessage | null> {
+    const list = await this.listMessages(idOrAddress, { ...filters, limit: 1 });
     return list[0] ?? null;
   }
 
-  getMessage(messageId: string): EmailMessage | null {
+  async getMessage(messageId: string): Promise<EmailMessage | null> {
     return this.database.getMessage(messageId);
   }
 
-  updateMessage(
+  async updateMessage(
     messageId: string,
     patch: { read?: boolean; starred?: boolean; folder?: MessageFolder },
-  ): EmailMessage | null {
-    const prev = this.database.getMessage(messageId);
+  ): Promise<EmailMessage | null> {
+    const prev = await this.database.getMessage(messageId);
     if (!prev) return null;
     const deletedAt =
       patch.folder === 'trash'
@@ -1180,12 +1183,12 @@ export class FlowMailStore {
           ? null
           : prev.deletedAt;
 
-    const updated = this.database.updateMessage(messageId, { ...patch, deletedAt });
+    const updated = await this.database.updateMessage(messageId, { ...patch, deletedAt });
     if (!updated) return null;
 
-    const inbox = this.getInboxByIdOrAddress(updated.inboxId);
+    const inbox = await this.getInboxByIdOrAddress(updated.inboxId);
     if (!prev.read && updated.read) {
-      this.recordActivity(
+      await this.recordActivity(
         'email:read',
         `Marked read: "${updated.subject}"`,
         inbox?.address,
@@ -1204,22 +1207,22 @@ export class FlowMailStore {
     return updated;
   }
 
-  deleteMessage(messageId: string, permanent = false): boolean {
-    const msg = this.database.getMessage(messageId);
+  async deleteMessage(messageId: string, permanent = false): Promise<boolean> {
+    const msg = await this.database.getMessage(messageId);
     if (!msg) return false;
-    const storedInbox = this.database.getInboxByIdOrAddress(msg.inboxId);
+    const storedInbox = await this.database.getInboxByIdOrAddress(msg.inboxId);
 
     // Move to Trash first unless permanent delete requested or already in Trash
     if (!permanent && msg.folder !== 'trash') {
-      this.updateMessage(messageId, { folder: 'trash' });
+      await this.updateMessage(messageId, { folder: 'trash' });
       return true;
     }
 
     if (msg.remoteId && storedInbox?.credentials) {
       void deleteLiveMxMessage(msg.remoteId, storedInbox.credentials);
     }
-    this.database.deleteMessage(messageId);
-    const updatedInbox = storedInbox ? this.getInboxByIdOrAddress(storedInbox.id) : null;
+    await this.database.deleteMessage(messageId);
+    const updatedInbox = storedInbox ? await this.getInboxByIdOrAddress(storedInbox.id) : null;
     this.emit({
       type: 'message:deleted',
       inboxId: msg.inboxId,
@@ -1230,11 +1233,11 @@ export class FlowMailStore {
     return true;
   }
 
-  bulkActionMessages(
+  async bulkActionMessages(
     messageIds: string[],
     action: 'markRead' | 'markUnread' | 'star' | 'unstar' | 'delete' | 'restore',
     options: { permanent?: boolean } = {},
-  ): { affected: number; updated: EmailMessage[]; deletedIds: string[] } {
+  ): Promise<{ affected: number; updated: EmailMessage[]; deletedIds: string[] }> {
     const uniqueIds = [...new Set(messageIds.filter((id) => typeof id === 'string' && id.trim().length > 0))].slice(
       0,
       500,
@@ -1245,46 +1248,46 @@ export class FlowMailStore {
 
     for (const id of uniqueIds) {
       if (action === 'markRead') {
-        const res = this.updateMessage(id, { read: true });
+        const res = await this.updateMessage(id, { read: true });
         if (res) {
           updated.push(res);
           affected += 1;
         }
       } else if (action === 'markUnread') {
-        const res = this.updateMessage(id, { read: false });
+        const res = await this.updateMessage(id, { read: false });
         if (res) {
           updated.push(res);
           affected += 1;
         }
       } else if (action === 'star') {
-        const res = this.updateMessage(id, { starred: true });
+        const res = await this.updateMessage(id, { starred: true });
         if (res) {
           updated.push(res);
           affected += 1;
         }
       } else if (action === 'unstar') {
-        const res = this.updateMessage(id, { starred: false });
+        const res = await this.updateMessage(id, { starred: false });
         if (res) {
           updated.push(res);
           affected += 1;
         }
       } else if (action === 'restore') {
-        const res = this.updateMessage(id, { folder: 'inbox' });
+        const res = await this.updateMessage(id, { folder: 'inbox' });
         if (res) {
           updated.push(res);
           affected += 1;
         }
       } else if (action === 'delete') {
-        const prev = this.database.getMessage(id);
+        const prev = await this.database.getMessage(id);
         if (!prev) continue;
         const shouldRemove = Boolean(options.permanent) || prev.folder === 'trash';
         if (shouldRemove) {
-          if (this.deleteMessage(id, true)) {
+          if (await this.deleteMessage(id, true)) {
             deletedIds.push(id);
             affected += 1;
           }
         } else {
-          const moved = this.updateMessage(id, { folder: 'trash' });
+          const moved = await this.updateMessage(id, { folder: 'trash' });
           if (moved) {
             updated.push(moved);
             affected += 1;
@@ -1296,14 +1299,14 @@ export class FlowMailStore {
     return { affected, updated, deletedIds };
   }
 
-  listOtpEntries(options: {
+  async listOtpEntries(options: {
     inboxId?: string;
     query?: string;
     kind?: 'all' | 'otp' | 'links';
     limit?: number;
-  } = {}): OtpEntry[] {
-    const inboxes = new Map(this.listInboxes().map((i) => [i.id, i.address]));
-    const { messages } = this.database.queryMessages({
+  } = {}): Promise<OtpEntry[]> {
+    const inboxes = new Map((await this.listInboxes()).map((i) => [i.id, i.address]));
+    const { messages } = await this.database.queryMessages({
       inboxId: options.inboxId || undefined,
       folder: 'all',
       query: options.query,
@@ -1346,7 +1349,7 @@ export class FlowMailStore {
     return true;
   }
 
-  private resolveWaiters(message: EmailMessage): void {
+  private async resolveWaiters(message: EmailMessage): Promise<void> {
     for (const waiter of Array.from(this.waiters)) {
       if (waiter.inboxId !== message.inboxId) continue;
       if (
@@ -1357,8 +1360,8 @@ export class FlowMailStore {
       ) {
         clearTimeout(waiter.timer);
         this.waiters.delete(waiter);
-        const inbox = this.getInboxByIdOrAddress(message.inboxId);
-        this.recordActivity(
+        const inbox = await this.getInboxByIdOrAddress(message.inboxId);
+        await this.recordActivity(
           'wait:matched',
           `API wait matched "${message.subject}"`,
           inbox?.address,
@@ -1371,7 +1374,7 @@ export class FlowMailStore {
   }
 
   async waitForMessage(idOrAddress: string, options: WaitOptions = {}): Promise<EmailMessage | null> {
-    const inbox = this.database.getInboxByIdOrAddress(idOrAddress);
+    const inbox = await this.database.getInboxByIdOrAddress(idOrAddress);
     if (!inbox) {
       throw new Error(`Inbox "${idOrAddress}" not found.`);
     }
@@ -1381,14 +1384,14 @@ export class FlowMailStore {
     }
 
     const sinceMs = options.since ? new Date(options.since).getTime() : 0;
-    const existing = this.listMessages(inbox.id, {
+    const existing = (await this.listMessages(inbox.id, {
       folder: 'inbox',
       subject: options.subject,
       from: options.from,
-    }).find((msg) => new Date(msg.receivedAt).getTime() >= sinceMs);
+    })).find((msg) => new Date(msg.receivedAt).getTime() >= sinceMs);
 
     if (existing) {
-      this.recordActivity(
+      await this.recordActivity(
         'wait:matched',
         `API wait matched "${existing.subject}"`,
         inbox.address,
@@ -1417,13 +1420,13 @@ export class FlowMailStore {
         timer: setTimeout(() => {
           cleanup();
           this.waiters.delete(waiter);
-          this.recordActivity(
+          void this.recordActivity(
             'wait:timeout',
             `API wait timed out after ${timeoutMs}ms`,
             inbox.address,
             undefined,
             'warning',
-          );
+          ).catch(() => undefined);
           resolve(null);
         }, timeoutMs),
       };
@@ -1432,17 +1435,17 @@ export class FlowMailStore {
 
       if (inbox.mode === 'live-mx') {
         pollInterval = setInterval(() => {
-          void this.syncLiveInbox(inbox.id);
+          void this.syncLiveInbox(inbox.id).catch(() => undefined);
         }, 2500);
       }
     });
   }
 
-  createApiKey(
+  async createApiKey(
     name: string,
     scopes: ApiKeyScope[] = ['read', 'write', 'webhooks', 'admin'],
     rateLimitPerMin = 120,
-  ): { summary: ApiKeySummary; plaintextKey: string } {
+  ): Promise<{ summary: ApiKeySummary; plaintextKey: string }> {
     const cleanName = name.trim() || 'CI Automation Key';
     const validScopes: ApiKeyScope[] = scopes.filter((s) =>
       ['read', 'write', 'webhooks', 'admin'].includes(s),
@@ -1464,8 +1467,8 @@ export class FlowMailStore {
       lastUsedAt: null,
     };
 
-    this.database.insertApiKey(stored);
-    this.recordActivity(
+    await this.database.insertApiKey(stored);
+    await this.recordActivity(
       'key:created',
       `Generated API key "${cleanName}" (${stored.prefix})`,
       undefined,
@@ -1486,8 +1489,8 @@ export class FlowMailStore {
     };
   }
 
-  listApiKeys(): ApiKeySummary[] {
-    return this.database.listApiKeys().map((k) => ({
+  async listApiKeys(): Promise<ApiKeySummary[]> {
+    return (await this.database.listApiKeys()).map((k) => ({
       id: k.id,
       name: k.name,
       prefix: k.prefix,
@@ -1498,17 +1501,17 @@ export class FlowMailStore {
     }));
   }
 
-  verifyApiKey(plaintext: string): ApiKeySummary | null {
+  async verifyApiKey(plaintext: string): Promise<ApiKeySummary | null> {
     if (!plaintext) return null;
     const candidateBuf = Buffer.from(hashKey(plaintext), 'hex');
-    for (const stored of this.database.listApiKeys()) {
+    for (const stored of await this.database.listApiKeys()) {
       const storedBuf = Buffer.from(stored.keyHash, 'hex');
       if (
         candidateBuf.length === storedBuf.length &&
         crypto.timingSafeEqual(candidateBuf, storedBuf)
       ) {
         const nowIso = new Date().toISOString();
-        this.database.touchApiKeyUsed(stored.id, nowIso);
+        await this.database.touchApiKeyUsed(stored.id, nowIso);
         return {
           id: stored.id,
           name: stored.name,
@@ -1523,11 +1526,11 @@ export class FlowMailStore {
     return null;
   }
 
-  revokeApiKey(id: string): boolean {
-    const key = this.database.listApiKeys().find((k) => k.id === id);
+  async revokeApiKey(id: string): Promise<boolean> {
+    const key = (await this.database.listApiKeys()).find((k) => k.id === id);
     if (!key) return false;
-    this.database.deleteApiKey(id);
-    this.recordActivity(
+    await this.database.deleteApiKey(id);
+    await this.recordActivity(
       'key:revoked',
       `Revoked API key "${key.name}" (${key.prefix})`,
       undefined,
@@ -1537,18 +1540,18 @@ export class FlowMailStore {
     return true;
   }
 
-  createWebhook(input: {
+  async createWebhook(input: {
     inboxIdOrAddress?: string | null;
     url: string;
     events?: string[];
-  }): { webhook: WebhookConfig; signingSecret: string } {
+  }): Promise<{ webhook: WebhookConfig; signingSecret: string }> {
     const check = validateOutboundWebhookUrl(input.url);
     if (!check.ok) throw new Error(check.error);
 
     let inboxId: string | null = null;
     let inboxAddress: string | undefined;
     if (input.inboxIdOrAddress && input.inboxIdOrAddress.trim()) {
-      const inbox = this.database.getInboxByIdOrAddress(input.inboxIdOrAddress);
+      const inbox = await this.database.getInboxByIdOrAddress(input.inboxIdOrAddress);
       if (!inbox) throw new Error('Target inbox not found.');
       inboxId = inbox.id;
       inboxAddress = inbox.address;
@@ -1567,8 +1570,8 @@ export class FlowMailStore {
       secretPlaintext: signingSecret,
     };
 
-    this.database.insertWebhook(record);
-    this.recordActivity(
+    await this.database.insertWebhook(record);
+    await this.recordActivity(
       'webhook:created',
       `Configured webhook listener ${check.url}`,
       inboxAddress,
@@ -1580,94 +1583,94 @@ export class FlowMailStore {
     return { webhook: publicWebhook, signingSecret };
   }
 
-  listWebhooks(inboxId?: string): WebhookConfig[] {
-    return this.database.listWebhooks(inboxId).map(({ secretPlaintext: _h, ...rest }) => rest);
+  async listWebhooks(inboxId?: string): Promise<WebhookConfig[]> {
+    return (await this.database.listWebhooks(inboxId)).map(({ secretPlaintext: _h, ...rest }) => rest);
   }
 
-  listWebhooksWithSecrets(inboxId: string) {
-    return this.database.listWebhooks(inboxId).filter((w) => w.enabled);
+  async listWebhooksWithSecrets(inboxId: string) {
+    return (await this.database.listWebhooks(inboxId)).filter((w) => w.enabled);
   }
 
-  listGlobalWebhooksWithSecrets() {
-    return this.database.listWebhooks().filter((w) => w.enabled && w.inboxId === null);
+  async listGlobalWebhooksWithSecrets() {
+    return (await this.database.listWebhooks()).filter((w) => w.enabled && w.inboxId === null);
   }
 
-  getWebhookWithSecret(id: string) {
+  async getWebhookWithSecret(id: string) {
     return this.database.getWebhookById(id);
   }
 
-  updateWebhook(id: string, patch: { enabled?: boolean; events?: string[] }): WebhookConfig | null {
-    const updated = this.database.updateWebhook(id, patch);
+  async updateWebhook(id: string, patch: { enabled?: boolean; events?: string[] }): Promise<WebhookConfig | null> {
+    const updated = await this.database.updateWebhook(id, patch);
     if (!updated) return null;
     const { secretPlaintext: _hidden, ...publicWebhook } = updated;
     return publicWebhook;
   }
 
-  deleteWebhook(id: string): boolean {
+  async deleteWebhook(id: string): Promise<boolean> {
     return this.database.deleteWebhook(id);
   }
 
-  recordWebhookDelivery(log: WebhookDeliveryLog): void {
-    this.database.insertWebhookDelivery(log);
+  async recordWebhookDelivery(log: WebhookDeliveryLog): Promise<void> {
+    await this.database.insertWebhookDelivery(log);
     this.emit({ type: 'webhook:delivery', delivery: log, inboxId: log.inboxId });
   }
 
-  listWebhookDeliveries(limit = 50): WebhookDeliveryLog[] {
+  async listWebhookDeliveries(limit = 50): Promise<WebhookDeliveryLog[]> {
     return this.database.listWebhookDeliveries(limit);
   }
 
-  markInboundEventSeen(eventId: string): boolean {
+  async markInboundEventSeen(eventId: string): Promise<boolean> {
     return this.database.markInboundEventSeen(eventId);
   }
 
-  recordApiUsage(log: Omit<ApiUsageLog, 'id' | 'timestamp'>): void {
-    this.database.insertApiUsageLog({
+  async recordApiUsage(log: Omit<ApiUsageLog, 'id' | 'timestamp'>): Promise<void> {
+    await this.database.insertApiUsageLog({
       id: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
       ...log,
     });
   }
 
-  listApiUsageLogs(limit = 50): ApiUsageLog[] {
+  async listApiUsageLogs(limit = 50): Promise<ApiUsageLog[]> {
     return this.database.listApiUsageLogs(limit);
   }
 
-  queryActivities(params: ActivityQueryParams = {}): { activities: ActivityEvent[]; total: number } {
+  async queryActivities(params: ActivityQueryParams = {}): Promise<{ activities: ActivityEvent[]; total: number }> {
     return this.database.queryActivities(params);
   }
 
-  listActivities(limit = 100): ActivityEvent[] {
-    return this.database.queryActivities({ limit }).activities;
+  async listActivities(limit = 100): Promise<ActivityEvent[]> {
+    return (await this.database.queryActivities({ limit })).activities;
   }
 
-  getRetentionDays(): number {
-    const raw = this.database.getSetting('retention_days');
+  async getRetentionDays(): Promise<number> {
+    const raw = await this.database.getSetting('retention_days');
     const parsed = Number(raw || process.env.RETENTION_DAYS || 30);
     return Number.isFinite(parsed) && parsed >= 1 ? parsed : 30;
   }
 
-  setRetentionDays(days: number): number {
+  async setRetentionDays(days: number): Promise<number> {
     const clamped = Math.min(Math.max(Math.round(days), 1), 365);
-    this.database.setSetting('retention_days', String(clamped));
+    await this.database.setSetting('retention_days', String(clamped));
     return clamped;
   }
 
-  getRequireApiKeySetting(): boolean | null {
-    const raw = this.database.getSetting('require_api_key');
+  async getRequireApiKeySetting(): Promise<boolean | null> {
+    const raw = await this.database.getSetting('require_api_key');
     if (raw === null) return null;
     return raw === 'true';
   }
 
-  setRequireApiKeySetting(val: boolean): void {
-    this.database.setSetting('require_api_key', val ? 'true' : 'false');
+  async setRequireApiKeySetting(val: boolean): Promise<void> {
+    await this.database.setSetting('require_api_key', val ? 'true' : 'false');
   }
 
   hasEnvAdminPasscode(): boolean {
     return Boolean((process.env.ADMIN_PASSCODE || '').trim());
   }
 
-  isAdminPasscodeConfigured(): boolean {
-    return this.hasEnvAdminPasscode() || this.database.getSetting('admin_passcode_hash') !== null;
+  async isAdminPasscodeConfigured(): Promise<boolean> {
+    return this.hasEnvAdminPasscode() || (await this.database.getSetting('admin_passcode_hash')) !== null;
   }
 
   private hashAdminPasscode(passcode: string): string {
@@ -1689,7 +1692,7 @@ export class FlowMailStore {
     }
   }
 
-  claimInitialAdminPasscode(passcode: string): boolean {
+  async claimInitialAdminPasscode(passcode: string): Promise<boolean> {
     if (this.hasEnvAdminPasscode()) {
       throw new Error('รหัสผ่านผู้ดูแลถูกกำหนดผ่านตัวแปรสภาพแวดล้อมของเซิร์ฟเวอร์แล้ว');
     }
@@ -1698,9 +1701,9 @@ export class FlowMailStore {
       throw new Error('รหัสผ่านระบบหลังบ้านต้องมีความยาว 4–128 ตัวอักษร');
     }
     const encoded = this.hashAdminPasscode(trimmed);
-    const claimed = this.database.insertSettingIfAbsent('admin_passcode_hash', encoded);
+    const claimed = await this.database.insertSettingIfAbsent('admin_passcode_hash', encoded);
     if (claimed) {
-      this.recordActivity(
+      await this.recordActivity(
         'auth:event',
         'Configured initial Admin Console passcode',
         undefined,
@@ -1711,31 +1714,31 @@ export class FlowMailStore {
     return claimed;
   }
 
-  verifyAdminPasscode(passcode: string): boolean {
+  async verifyAdminPasscode(passcode: string): Promise<boolean> {
     const envPass = (process.env.ADMIN_PASSCODE || '').trim();
     if (envPass) {
       const a = crypto.createHash('sha256').update(passcode).digest();
       const b = crypto.createHash('sha256').update(envPass).digest();
       return crypto.timingSafeEqual(a, b);
     }
-    const storedHash = this.database.getSetting('admin_passcode_hash');
+    const storedHash = await this.database.getSetting('admin_passcode_hash');
     if (!storedHash) return false;
     return this.verifyHashedPasscode(passcode, storedHash);
   }
 
-  updateAdminPasscode(currentPasscode: string, newPasscode: string): void {
+  async updateAdminPasscode(currentPasscode: string, newPasscode: string): Promise<void> {
     if (this.hasEnvAdminPasscode()) {
       throw new Error('ไม่สามารถเปลี่ยนรหัสผ่านจากหน้าเว็บได้ เนื่องจากกำหนดผ่าน ADMIN_PASSCODE บนเซิร์ฟเวอร์');
     }
-    if (!this.verifyAdminPasscode(currentPasscode)) {
+    if (!(await this.verifyAdminPasscode(currentPasscode))) {
       throw new Error('รหัสผ่านปัจจุบันไม่ถูกต้อง');
     }
     const trimmed = newPasscode.trim();
     if (trimmed.length < 4 || trimmed.length > 128) {
       throw new Error('รหัสผ่านใหม่ต้องมีความยาว 4–128 ตัวอักษร');
     }
-    this.database.setSetting('admin_passcode_hash', this.hashAdminPasscode(trimmed));
-    this.recordActivity(
+    await this.database.setSetting('admin_passcode_hash', this.hashAdminPasscode(trimmed));
+    await this.recordActivity(
       'auth:event',
       'Updated Admin Console passcode',
       undefined,
@@ -1744,11 +1747,11 @@ export class FlowMailStore {
     );
   }
 
-  runMaintenancePrune(): { expiredInboxes: number; deletedMessages: number; deletedLogs: number } {
-    const beforeCount = this.database.listInboxes().length;
-    this.pruneExpired();
-    const afterCount = this.database.listInboxes().length;
-    const pruned = this.database.pruneRetention(this.getRetentionDays());
+  async runMaintenancePrune(): Promise<{ expiredInboxes: number; deletedMessages: number; deletedLogs: number }> {
+    const beforeCount = (await this.database.listInboxes()).length;
+    await this.pruneExpired();
+    const afterCount = (await this.database.listInboxes()).length;
+    const pruned = await this.database.pruneRetention(await this.getRetentionDays());
     return {
       expiredInboxes: Math.max(0, beforeCount - afterCount),
       deletedMessages: pruned.deletedMessages,
@@ -1756,13 +1759,13 @@ export class FlowMailStore {
     };
   }
 
-  getAdminOverview(params: {
+  async getAdminOverview(params: {
     requireApiKey: boolean;
     smtpPort: number | null;
     uptimeSeconds: number;
-  }): AdminOverview {
-    const allInboxes = this.listInboxes();
-    const agg = this.database.getAggregateStats();
+  }): Promise<AdminOverview> {
+    const allInboxes = await this.listInboxes();
+    const agg = await this.database.getAggregateStats();
     const byProvider: Record<InboxProvider, number> = {
       'mail.tm': 0,
       'gmail-alias': 0,
@@ -1781,8 +1784,8 @@ export class FlowMailStore {
       byStatus[inb.status] = (byStatus[inb.status] ?? 0) + 1;
     }
 
-    const recentErrors = this.database
-      .queryActivities({ status: 'error', limit: 8 })
+    const recentErrors = (await this.database
+      .queryActivities({ status: 'error', limit: 8 }))
       .activities;
 
     return {
@@ -1790,12 +1793,12 @@ export class FlowMailStore {
       messagesTotal: agg.messagesTotal,
       unreadTotal: agg.unreadTotal,
       otpCount: agg.otpMessagesTotal,
-      apiKeysCount: this.listApiKeys().length,
-      webhooksCount: this.listWebhooks().length,
-      deliveriesCount: this.listWebhookDeliveries(200).length,
+      apiKeysCount: (await this.listApiKeys()).length,
+      webhooksCount: (await this.listWebhooks()).length,
+      deliveriesCount: (await this.listWebhookDeliveries(200)).length,
       byProvider,
       byStatus,
-      retentionDays: this.getRetentionDays(),
+      retentionDays: await this.getRetentionDays(),
       requireApiKey: params.requireApiKey,
       smtpPort: params.smtpPort,
       uptimeSeconds: params.uptimeSeconds,

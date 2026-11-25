@@ -27,14 +27,14 @@ export function hashSessionToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-export function issueAuthSession(
+export async function issueAuthSession(
   store: FlowMailStore,
   input: { kind: SessionKind; scopes: ApiKeyScope[]; ttlMs?: number },
-): { token: string; expiresAt: string } {
+): Promise<{ token: string; expiresAt: string }> {
   const token = `fm_${input.kind === 'admin' ? 'adm' : 'ses'}_${crypto.randomBytes(24).toString('hex')}`;
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + (input.ttlMs ?? 12 * 60 * 60 * 1000));
-  store.database.insertSession({
+  await store.database.insertSession({
     tokenHash: hashSessionToken(token),
     kind: input.kind,
     scopes: Array.from(new Set(input.scopes)),
@@ -44,8 +44,8 @@ export function issueAuthSession(
   return { token, expiresAt: expiresAt.toISOString() };
 }
 
-export function revokeAuthSession(store: FlowMailStore, token: string): boolean {
-  return store.database.revokeSession(hashSessionToken(token));
+export async function revokeAuthSession(store: FlowMailStore, token: string): Promise<boolean> {
+  return await store.database.revokeSession(hashSessionToken(token));
 }
 
 export function extractBearerOrApiKey(req: Request): string | null {
@@ -67,12 +67,12 @@ export function createApiAuthMiddleware(
   store: FlowMailStore,
   getRequireApiKey: () => boolean,
 ): (req: Request, res: Response, next: NextFunction) => void {
-  return (req, res, next) => {
+  const handle = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const token = extractBearerOrApiKey(req);
     let authCtx: AuthContext;
 
     if (token) {
-      const session = store.database.getSession(hashSessionToken(token));
+      const session = await store.database.getSession(hashSessionToken(token));
       if (session) {
         authCtx = {
           authType: 'session',
@@ -80,9 +80,9 @@ export function createApiAuthMiddleware(
           sessionId: session.tokenHash,
         };
       } else {
-        const verifiedKey = store.verifyApiKey(token);
+        const verifiedKey = await store.verifyApiKey(token);
         if (!verifiedKey) {
-          store.recordActivity(
+          await store.recordActivity(
             'auth:failed',
             `Rejected invalid API credential on ${req.method} ${req.originalUrl}`,
             undefined,
@@ -102,7 +102,7 @@ export function createApiAuthMiddleware(
         };
       }
     } else if (getRequireApiKey()) {
-      store.recordActivity(
+      await store.recordActivity(
         'auth:failed',
         `Blocked unauthenticated request to ${req.method} ${req.originalUrl}`,
         undefined,
@@ -132,7 +132,7 @@ export function createApiAuthMiddleware(
     const bucketId =
       authCtx.key?.id ??
       (authCtx.sessionId ? `session:${authCtx.sessionId.slice(0, 12)}` : `ip:${req.ip || 'local'}`);
-    const rl = store.database.consumeRateLimit(`rl:${bucketId}`, limit);
+    const rl = await store.database.consumeRateLimit(`rl:${bucketId}`, limit);
     res.setHeader('X-RateLimit-Limit', String(limit));
     res.setHeader('X-RateLimit-Remaining', String(rl.remaining));
     if (!rl.allowed) {
@@ -145,6 +145,9 @@ export function createApiAuthMiddleware(
       return;
     }
     next();
+  };
+  return (req, res, next) => {
+    void handle(req, res, next).catch(next);
   };
 }
 
@@ -162,10 +165,10 @@ export function requireScope(scope: ApiKeyScope) {
 }
 
 export function createAdminAuthMiddleware(store: FlowMailStore) {
-  return (req: Request, res: Response, next: NextFunction): void => {
+  const handle = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const auth = req.header('authorization');
     const token = auth?.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
-    const session = token ? store.database.getSession(hashSessionToken(token)) : null;
+    const session = token ? await store.database.getSession(hashSessionToken(token)) : null;
     if (!token || !session || session.kind !== 'admin') {
       res.status(401).json({
         error: 'ต้องเข้าสู่ระบบผู้ดูแลระบบหลังบ้าน (Admin) ก่อนดำเนินการ',
@@ -180,6 +183,9 @@ export function createAdminAuthMiddleware(store: FlowMailStore) {
     };
     next();
   };
+  return (req: Request, res: Response, next: NextFunction): void => {
+    void handle(req, res, next).catch(next);
+  };
 }
 
 export function extractAdminToken(req: Request): string | null {
@@ -187,9 +193,12 @@ export function extractAdminToken(req: Request): string | null {
   return auth?.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : null;
 }
 
-export function isAdminTokenValid(store: FlowMailStore, token: string | null): boolean {
+export async function isAdminTokenValid(
+  store: FlowMailStore,
+  token: string | null,
+): Promise<boolean> {
   if (!token) return false;
-  const session = store.database.getSession(hashSessionToken(token));
+  const session = await store.database.getSession(hashSessionToken(token));
   return session?.kind === 'admin';
 }
 

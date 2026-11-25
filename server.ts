@@ -47,17 +47,18 @@ export interface ServerInstanceOptions {
   skipVite?: boolean;
 }
 
-export function createAppInstance(options: ServerInstanceOptions = {}) {
+export async function createAppInstance(options: ServerInstanceOptions = {}) {
   const startedAt = Date.now();
   const store = new FlowMailStore(
     'dbPath' in options || 'legacyJsonPath' in options
       ? { filePath: options.dbPath ?? null, legacyJsonPath: options.legacyJsonPath }
       : undefined,
   );
+  await store.ready;
   const smtpBridge = startSmtpBridge(store, options.smtpPort);
 
   let requireApiKeyForExternal =
-    store.getRequireApiKeySetting() ??
+    (await store.getRequireApiKeySetting()) ??
     (process.env.REQUIRE_API_KEY === 'true');
 
   const authenticateApiRequest = createApiAuthMiddleware(store, () => requireApiKeyForExternal);
@@ -119,7 +120,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         });
         lastStatus = resp.status;
         if (resp.ok) {
-          store.recordWebhookDelivery({
+          await store.recordWebhookDelivery({
             id: crypto.randomUUID(),
             webhookId: params.webhookId,
             inboxId: params.inboxId,
@@ -134,7 +135,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
             createdAt: new Date().toISOString(),
             deliveredAt: new Date().toISOString(),
           });
-          store.recordActivity(
+          await store.recordActivity(
             'webhook:delivered',
             `Webhook delivered (${resp.status}) to ${check.url}`,
             params.inboxAddress,
@@ -159,7 +160,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       }
     }
 
-    store.recordWebhookDelivery({
+    await store.recordWebhookDelivery({
       id: crypto.randomUUID(),
       webhookId: params.webhookId,
       inboxId: params.inboxId,
@@ -174,7 +175,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       createdAt: new Date().toISOString(),
       deliveredAt: null,
     });
-    store.recordActivity(
+    await store.recordActivity(
       'webhook:failed',
       `Webhook delivery failed for ${check.url}`,
       params.inboxAddress,
@@ -182,7 +183,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       'error',
     );
     if (params.maxAttempts === undefined) {
-      store.database.enqueueJob({
+      await store.database.enqueueJob({
         id: crypto.randomUUID(),
         type: 'webhook.retry',
         idempotencyKey: `webhook-retry:${params.eventId}`,
@@ -218,10 +219,10 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       extracted?: { primaryOtp?: string | null; primaryActionUrl?: string | null };
     },
   ): Promise<void> {
-    const inbox = store.getInboxByIdOrAddress(inboxId);
+    const inbox = await store.getInboxByIdOrAddress(inboxId);
     if (!inbox) return;
 
-    const registered = store.listWebhooksWithSecrets(inbox.id);
+    const registered = await store.listWebhooksWithSecrets(inbox.id);
     const targets: {
       webhookId: string | null;
       url: string;
@@ -291,8 +292,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
   }
 
-  function dispatchWebhooksForInboxCreated(inbox: { id: string; address: string; provider: string }): void {
-    for (const hook of store.listGlobalWebhooksWithSecrets()) {
+  async function dispatchWebhooksForInboxCreated(inbox: { id: string; address: string; provider: string }): Promise<void> {
+    for (const hook of await store.listGlobalWebhooksWithSecrets()) {
       if (!hook.events.includes('inbox.created') && !hook.events.includes('*')) continue;
       const eventId = `evt_${crypto.randomBytes(8).toString('hex')}`;
       void deliverSingleWebhook({
@@ -355,14 +356,14 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     const start = Date.now();
     res.on('finish', () => {
       try {
-        store.recordApiUsage({
+        void store.recordApiUsage({
           method: req.method,
           path: req.path,
           status: res.statusCode,
           durationMs: Date.now() - start,
           authType: req.auth?.authType ?? 'anonymous',
           keyPrefix: req.auth?.key?.prefix ?? null,
-        });
+        }).catch(() => undefined);
       } catch {
         // Non-fatal usage logging error
       }
@@ -372,7 +373,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
 
   // Production Health Check Endpoint (no secrets exposed)
   app.get('/api/health', async (_req, res) => {
-    const dbOk = store.database.ping();
+    const dbOk = await store.database.ping();
     const liveMxDomains = await fetchLiveMxDomains().catch(() => []);
     const outboundSmtp = getOutboundSmtpConfig();
     const providerOk = liveMxDomains.length > 0;
@@ -394,7 +395,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         database: {
           status: dbOk ? 'ok' : 'unavailable',
           detail: dbOk
-            ? `SQLite (${store.database.getMigrationCount()} migration(s) applied)`
+            ? `${store.database.client.kind === 'postgres' ? 'PostgreSQL' : 'SQLite'} (${await store.database.getMigrationCount()} migration(s) applied)`
             : 'Database check failed',
         },
         emailProvider: {
@@ -419,9 +420,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.status(overallStatus === 'ok' ? 200 : 503).json(report);
   });
 
-  app.get('/api/health/worker', (_req, res) => {
-    const heartbeats = store.database.listWorkerHeartbeats();
-    const jobs = store.database.listJobs(20).map((job) => ({
+  app.get('/api/health/worker', async (_req, res) => {
+    const heartbeats = await store.database.listWorkerHeartbeats();
+    const jobs = (await store.database.listJobs(20)).map((job) => ({
       id: job.id,
       type: job.type,
       attempts: job.attempts,
@@ -439,8 +440,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
 
   // Session bootstrap: unauthenticated callers receive READ-ONLY scope only.
   // Elevated scopes require a verified admin passcode or API key supplied in the request body.
-  app.post('/api/v1/session', (req, res) => {
-    const rl = store.database.consumeRateLimit(`rl:session-bootstrap:${req.ip || 'local'}`, 60);
+  app.post('/api/v1/session', async (req, res) => {
+    const rl = await store.database.consumeRateLimit(`rl:session-bootstrap:${req.ip || 'local'}`, 60);
     if (!rl.allowed) {
       res.setHeader('Retry-After', String(rl.resetSec));
       res.status(429).json({ error: 'Too many session requests.', code: 'RATE_LIMITED' });
@@ -460,25 +461,25 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     let kind: 'ui' | 'elevated' = 'ui';
 
     if (passcode) {
-      if (!store.verifyAdminPasscode(passcode)) {
-        store.recordActivity('auth:failed', 'Rejected session bootstrap with invalid passcode', undefined, undefined, 'warning');
+      if (!(await store.verifyAdminPasscode(passcode))) {
+        await store.recordActivity('auth:failed', 'Rejected session bootstrap with invalid passcode', undefined, undefined, 'warning');
         res.status(401).json({ error: 'Invalid session credential.', code: 'INVALID_SESSION_CREDENTIAL' });
         return;
       }
       scopes = ['read', 'write', 'webhooks', 'admin'];
       kind = 'elevated';
     } else if (apiKey) {
-      const verified = store.verifyApiKey(apiKey);
+      const verified = await store.verifyApiKey(apiKey);
       if (!verified) {
-        store.recordActivity('auth:failed', 'Rejected session bootstrap with invalid API key', undefined, undefined, 'warning');
+        await store.recordActivity('auth:failed', 'Rejected session bootstrap with invalid API key', undefined, undefined, 'warning');
         res.status(401).json({ error: 'Invalid session credential.', code: 'INVALID_SESSION_CREDENTIAL' });
         return;
       }
       scopes = verified.scopes;
     }
 
-    const session = issueAuthSession(store, { kind, scopes });
-    store.recordActivity(
+    const session = await issueAuthSession(store, { kind, scopes });
+    await store.recordActivity(
       'auth:event',
       `Issued ${kind} session token (${scopes.join(', ')})`,
       undefined,
@@ -493,10 +494,10 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     });
   });
 
-  app.post('/api/v1/session/logout', (req, res) => {
+  app.post('/api/v1/session/logout', async (req, res) => {
     const auth = req.header('authorization');
     const token = auth?.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
-    const revoked = token ? revokeAuthSession(store, token) : false;
+    const revoked = token ? await revokeAuthSession(store, token) : false;
     res.json({ revoked });
   });
 
@@ -509,7 +510,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       webhookDomains: WEBHOOK_DOMAINS,
       smtpPort: smtpBridge.port,
       requireApiKey: requireApiKeyForExternal,
-      inboxCount: store.listInboxes().length,
+      inboxCount: (await store.listInboxes()).length,
     });
   });
 
@@ -535,7 +536,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     const outbound = getOutboundSmtpConfig();
     res.json({
       requireApiKey: requireApiKeyForExternal,
-      retentionDays: store.getRetentionDays(),
+      retentionDays: await store.getRetentionDays(),
       liveMxDomains,
       webhookDomains: WEBHOOK_DOMAINS,
       smtpPort: smtpBridge.port,
@@ -552,8 +553,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   api.patch('/settings', requireScope('admin'), async (req, res) => {
     if (typeof req.body?.requireApiKey === 'boolean') {
       requireApiKeyForExternal = req.body.requireApiKey;
-      store.setRequireApiKeySetting(requireApiKeyForExternal);
-      store.recordActivity(
+      await store.setRequireApiKeySetting(requireApiKeyForExternal);
+      await store.recordActivity(
         'auth:event',
         requireApiKeyForExternal
           ? 'Enabled strict API Key authentication for external callers'
@@ -564,12 +565,12 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       );
     }
     if (typeof req.body?.retentionDays === 'number') {
-      store.setRetentionDays(req.body.retentionDays);
+      await store.setRetentionDays(req.body.retentionDays);
     }
     const liveMxDomains = await fetchLiveMxDomains();
     res.json({
       requireApiKey: requireApiKeyForExternal,
-      retentionDays: store.getRetentionDays(),
+      retentionDays: await store.getRetentionDays(),
       liveMxDomains,
       webhookDomains: WEBHOOK_DOMAINS,
       smtpPort: smtpBridge.port,
@@ -577,11 +578,11 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // API Keys
-  api.get('/keys', requireScope('read'), (_req, res) => {
-    res.json({ keys: store.listApiKeys() });
+  api.get('/keys', requireScope('read'), async (_req, res) => {
+    res.json({ keys: await store.listApiKeys() });
   });
 
-  api.post('/keys', requireScope('admin'), (req, res) => {
+  api.post('/keys', requireScope('admin'), async (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name : 'Automation API Key';
     const scopes = Array.isArray(req.body?.scopes)
       ? (req.body.scopes as ApiKeyScope[])
@@ -589,15 +590,15 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     const rateLimitPerMin =
       typeof req.body?.rateLimitPerMin === 'number' ? req.body.rateLimitPerMin : 120;
 
-    const created = store.createApiKey(name, scopes, rateLimitPerMin);
+    const created = await store.createApiKey(name, scopes, rateLimitPerMin);
     res.status(201).json({
       key: created.summary,
       plaintextKey: created.plaintextKey,
     });
   });
 
-  api.delete('/keys/:id', requireScope('admin'), (req, res) => {
-    const ok = store.revokeApiKey(req.params.id);
+  api.delete('/keys/:id', requireScope('admin'), async (req, res) => {
+    const ok = await store.revokeApiKey(req.params.id);
     if (!ok) {
       res.status(404).json({ error: 'API key not found.' });
       return;
@@ -608,7 +609,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   // Provision / List Addresses & Inboxes (both /inboxes and /addresses routes supported!)
   const handleListAddresses = async (_req: Request, res: Response) => {
     const liveMxDomains = await fetchLiveMxDomains();
-    const list = store.listInboxes();
+    const list = await store.listInboxes();
     res.json({
       inboxes: list,
       addresses: list,
@@ -641,7 +642,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
               : undefined;
         const strategy = body.strategy === 'dot' ? 'dot' : 'plus';
         const tag = typeof body.tag === 'string' ? body.tag : undefined;
-        const inbox = store.createAliasInbox({
+        const inbox = await store.createAliasInbox({
           baseEmail,
           domain,
           provider:
@@ -655,10 +656,10 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
           ttl,
           label,
           webhookUrl,
-          deliverCredentialsEmail,
-        });
-        dispatchWebhooksForInboxCreated(inbox);
-        res.status(201).json({ inbox, address: inbox });
+        deliverCredentialsEmail,
+      });
+      await dispatchWebhooksForInboxCreated(inbox);
+      res.status(201).json({ inbox, address: inbox });
         return;
       }
 
@@ -676,14 +677,14 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         if (liveDomains.length > 0 && (!domain || liveDomains.includes(domain))) {
           const account = await provisionLiveMxAccount({ prefix, domain });
           const mx = await checkDomainMxRecords(account.domain).catch(() => null);
-          const inbox = store.registerLiveMxInbox(account, {
+          const inbox = await store.registerLiveMxInbox(account, {
             ttl,
             label,
             webhookUrl,
             mxVerified: mx?.mxVerified ?? true,
             deliverCredentialsEmail,
           });
-          dispatchWebhooksForInboxCreated(inbox);
+          await dispatchWebhooksForInboxCreated(inbox);
           res.status(201).json({ inbox, address: inbox });
           return;
         }
@@ -697,7 +698,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         }
       }
 
-      const inbox = store.createInbox({
+      const inbox = await store.createInbox({
         prefix,
         domain,
         ttl,
@@ -706,7 +707,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         provider,
         deliverCredentialsEmail,
       });
-      dispatchWebhooksForInboxCreated(inbox);
+          await dispatchWebhooksForInboxCreated(inbox);
       res.status(201).json({ inbox, address: inbox });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to create inbox.';
@@ -719,8 +720,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   api.post('/inboxes', requireScope('write'), handleCreateAddress);
   api.post('/addresses', requireScope('write'), handleCreateAddress);
 
-  api.get('/inboxes/:idOrAddress', requireScope('read'), (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+  api.get('/inboxes/:idOrAddress', requireScope('read'), async (req, res) => {
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -728,9 +729,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ inbox });
   });
 
-  api.patch('/addresses/:idOrAddress', requireScope('write'), (req, res) => {
+  api.patch('/addresses/:idOrAddress', requireScope('write'), async (req, res) => {
     try {
-      const updated = store.updateInbox(req.params.idOrAddress, {
+      const updated = await store.updateInbox(req.params.idOrAddress, {
         label: typeof req.body?.label === 'string' ? req.body.label : undefined,
         status: typeof req.body?.status === 'string' ? req.body.status : undefined,
         webhookUrl:
@@ -751,9 +752,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
   });
 
-  api.patch('/inboxes/:idOrAddress', requireScope('write'), (req, res) => {
+  api.patch('/inboxes/:idOrAddress', requireScope('write'), async (req, res) => {
     try {
-      const updated = store.updateInbox(req.params.idOrAddress, {
+      const updated = await store.updateInbox(req.params.idOrAddress, {
         label: typeof req.body?.label === 'string' ? req.body.label : undefined,
         status: typeof req.body?.status === 'string' ? req.body.status : undefined,
         webhookUrl:
@@ -774,13 +775,13 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
   });
 
-  api.post('/addresses/:idOrAddress/switch', requireScope('read'), (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+  api.post('/addresses/:idOrAddress/switch', requireScope('read'), async (req, res) => {
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Address not found.' });
       return;
     }
-    store.recordActivity(
+    await store.recordActivity(
       'address:switched',
       `Switched active mailbox to ${inbox.address}`,
       inbox.address,
@@ -799,7 +800,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       res.json({
         inbox: result.inbox,
         newMessages: result.added.length,
-        messages: store.listMessages(result.inbox.id),
+        messages: await store.listMessages(result.inbox.id),
       });
     } catch (err) {
       if (err instanceof MailTmRateLimitError) {
@@ -816,22 +817,22 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
   });
 
-  api.post('/inboxes/:idOrAddress/import-messages', requireScope('write'), (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+  api.post('/inboxes/:idOrAddress/import-messages', requireScope('write'), async (req, res) => {
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
     }
 
     const rawList = Array.isArray(req.body?.messages) ? req.body.messages : [];
-    const beforeIds = new Set(store.listMessages(inbox.id, { folder: 'all', limit: 500 }).map((m) => m.id));
+    const beforeIds = new Set((await store.listMessages(inbox.id, { folder: 'all', limit: 500 })).map((m) => m.id));
     let addedCount = 0;
 
     for (const item of rawList.slice(0, 30)) {
       if (!item || typeof item !== 'object') continue;
       const rec = item as Record<string, unknown>;
       try {
-        const msg = store.ingestMessage({
+        const msg = await store.ingestMessage({
           to: inbox.address,
           from: typeof rec.from === 'string' ? rec.from : undefined,
           fromName: typeof rec.fromName === 'string' ? rec.fromName : undefined,
@@ -856,19 +857,19 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       }
     }
 
-    const updatedInbox = store.markInboxSynced(inbox.id, addedCount) ?? inbox;
+    const updatedInbox = (await store.markInboxSynced(inbox.id, addedCount)) ?? inbox;
     res.json({
       inbox: updatedInbox,
       newMessages: addedCount,
-      messages: store.listMessages(inbox.id, { folder: 'all', limit: 200 }),
+      messages: await store.listMessages(inbox.id, { folder: 'all', limit: 200 }),
     });
   });
 
-  api.patch('/inboxes/:idOrAddress/webhook', requireScope('webhooks'), (req, res) => {
+  api.patch('/inboxes/:idOrAddress/webhook', requireScope('webhooks'), async (req, res) => {
     try {
       const webhookUrl =
         typeof req.body?.webhookUrl === 'string' ? req.body.webhookUrl : null;
-      const updated = store.updateInboxWebhook(req.params.idOrAddress, webhookUrl);
+      const updated = await store.updateInboxWebhook(req.params.idOrAddress, webhookUrl);
       if (!updated) {
         res.status(404).json({ error: 'Inbox not found.' });
         return;
@@ -881,7 +882,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   api.post('/inboxes/:idOrAddress/webhook/test', requireScope('webhooks'), async (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -922,8 +923,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.status(result.ok ? 200 : 502).json(result);
   });
 
-  const handleDeleteAddress = (req: Request, res: Response) => {
-    const ok = store.deleteInbox(req.params.idOrAddress);
+  const handleDeleteAddress = async (req: Request, res: Response) => {
+    const ok = await store.deleteInbox(req.params.idOrAddress);
     if (!ok) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -933,19 +934,19 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   api.delete('/inboxes/:idOrAddress', requireScope('write'), handleDeleteAddress);
   api.delete('/addresses/:idOrAddress', requireScope('write'), handleDeleteAddress);
 
-  api.post('/inboxes/:idOrAddress/clear', requireScope('write'), (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+  api.post('/inboxes/:idOrAddress/clear', requireScope('write'), async (req, res) => {
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
     }
-    const deletedCount = store.clearInboxMessages(inbox.id);
+    const deletedCount = await store.clearInboxMessages(inbox.id);
     res.json({ cleared: deletedCount });
   });
 
   // Messages in an inbox
   api.get('/inboxes/:idOrAddress/messages', requireScope('read'), async (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -957,7 +958,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     const limit = Math.min(Math.max(Number(req.query.limit ?? 100) || 100, 1), 500);
     const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
 
-    const { messages, total } = store.queryMessagesPaginated({
+    const { messages, total } = await store.queryMessagesPaginated({
       inboxId: inbox.id,
       folder: folderParam,
       subject: typeof req.query.subject === 'string' ? req.query.subject : undefined,
@@ -970,7 +971,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       offset,
     });
     res.json({
-      inbox: store.getInboxByIdOrAddress(inbox.id) ?? inbox,
+      inbox: (await store.getInboxByIdOrAddress(inbox.id)) ?? inbox,
       messages,
       total,
       limit,
@@ -979,9 +980,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // Global paginated messages endpoint (Phase 4 API spec)
-  api.get('/messages', requireScope('read'), (req, res) => {
+  api.get('/messages', requireScope('read'), async (req, res) => {
     const inboxIdRaw = typeof req.query.inboxId === 'string' ? req.query.inboxId : undefined;
-    const inbox = inboxIdRaw ? store.getInboxByIdOrAddress(inboxIdRaw) : null;
+    const inbox = inboxIdRaw ? await store.getInboxByIdOrAddress(inboxIdRaw) : null;
     if (inboxIdRaw && !inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -990,7 +991,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     const limit = Math.min(Math.max(Number(req.query.limit ?? 50) || 50, 1), 200);
     const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
 
-    const { messages, total } = store.queryMessagesPaginated({
+    const { messages, total } = await store.queryMessagesPaginated({
       inboxId: inbox?.id,
       folder,
       query: typeof req.query.q === 'string' ? req.query.q : undefined,
@@ -1005,7 +1006,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
 
   // Latest message shortcut for automated assertions
   api.get('/inboxes/:idOrAddress/latest', requireScope('read'), async (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -1013,7 +1014,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     if (inbox.mode === 'live-mx') {
       await store.syncLiveInbox(inbox.id).catch(() => undefined);
     }
-    const message = store.getLatestMessage(inbox.id, {
+    const message = await store.getLatestMessage(inbox.id, {
       folder: 'inbox',
       subject: typeof req.query.subject === 'string' ? req.query.subject : undefined,
       from: typeof req.query.from === 'string' ? req.query.from : undefined,
@@ -1031,7 +1032,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
 
   // Long-poll wait endpoint for Playwright / Cypress / CI tests
   api.get('/inboxes/:idOrAddress/wait', requireScope('read'), async (req, res) => {
-    const inbox = store.getInboxByIdOrAddress(req.params.idOrAddress);
+    const inbox = await store.getInboxByIdOrAddress(req.params.idOrAddress);
     if (!inbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -1067,7 +1068,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // Real inbound email ingestion (REST JSON + Mailgun/SendGrid/Postmark webhook formats)
-  const handleIngest = (req: Request, res: Response) => {
+  const handleIngest = async (req: Request, res: Response) => {
     try {
       // Optional HMAC signature verification if WEBHOOK_INBOUND_SECRET is configured
       const inboundSecret = process.env.WEBHOOK_INBOUND_SECRET?.trim();
@@ -1075,7 +1076,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         const sig = req.header('x-relaybox-signature');
         const check = verifyWebhookSignature(inboundSecret, sig, req.rawBody || JSON.stringify(req.body ?? {}));
         if (!check.ok) {
-          store.recordActivity('webhook:failed', 'Rejected forged inbound webhook', undefined, check.reason, 'error');
+          await store.recordActivity('webhook:failed', 'Rejected forged inbound webhook', undefined, check.reason, 'error');
           res.status(401).json({ error: check.reason, code: 'INVALID_WEBHOOK_SIGNATURE' });
           return;
         }
@@ -1084,7 +1085,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       // Duplicate event prevention via X-Event-Id / Idempotency-Key
       const eventId = req.header('x-event-id') || req.header('idempotency-key');
       if (eventId && eventId.trim()) {
-        const isNew = store.markInboundEventSeen(eventId.trim());
+        const isNew = await store.markInboundEventSeen(eventId.trim());
         if (!isNew) {
           res.status(200).json({ duplicate: true, eventId: eventId.trim() });
           return;
@@ -1143,7 +1144,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         remoteId: typeof body.remoteId === 'string' ? body.remoteId : undefined,
       };
 
-      const message = store.ingestMessage(payload);
+      const message = await store.ingestMessage(payload);
       void dispatchWebhooksForMessage(message.inboxId, message);
       res.status(201).json({
         message,
@@ -1160,7 +1161,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   api.post('/inbound', requireScope('webhooks'), handleIngest);
 
   // Compose Draft or Send Internal / Outbound message
-  api.post('/messages/send', requireScope('write'), (req, res) => {
+  api.post('/messages/send', requireScope('write'), async (req, res) => {
     try {
       const body = req.body ?? {};
       const inboxIdOrAddress = String(body.inboxId || body.from || '');
@@ -1175,7 +1176,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
         return;
       }
 
-      const msg = store.saveDraftOrSentMessage({
+      const msg = await store.saveDraftOrSentMessage({
         inboxIdOrAddress,
         to,
         subject,
@@ -1190,8 +1191,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // Single message operations
-  api.get('/messages/:messageId', requireScope('read'), (req, res) => {
-    const message = store.getMessage(req.params.messageId);
+  api.get('/messages/:messageId', requireScope('read'), async (req, res) => {
+    const message = await store.getMessage(req.params.messageId);
     if (!message) {
       res.status(404).json({ error: 'Message not found.' });
       return;
@@ -1199,7 +1200,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ message });
   });
 
-  api.patch('/messages/:messageId', requireScope('write'), (req, res) => {
+  api.patch('/messages/:messageId', requireScope('write'), async (req, res) => {
     const patch: { read?: boolean; starred?: boolean; folder?: MessageFolder } = {};
     if (typeof req.body?.read === 'boolean') patch.read = req.body.read;
     if (typeof req.body?.starred === 'boolean') patch.starred = req.body.starred;
@@ -1210,7 +1211,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       patch.folder = req.body.folder as MessageFolder;
     }
 
-    const updated = store.updateMessage(req.params.messageId, patch);
+    const updated = await store.updateMessage(req.params.messageId, patch);
     if (!updated) {
       res.status(404).json({ error: 'Message not found.' });
       return;
@@ -1218,8 +1219,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ message: updated });
   });
 
-  api.post('/messages/:messageId/restore', requireScope('write'), (req, res) => {
-    const updated = store.updateMessage(req.params.messageId, { folder: 'inbox' });
+  api.post('/messages/:messageId/restore', requireScope('write'), async (req, res) => {
+    const updated = await store.updateMessage(req.params.messageId, { folder: 'inbox' });
     if (!updated) {
       res.status(404).json({ error: 'Message not found.' });
       return;
@@ -1227,9 +1228,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ message: updated });
   });
 
-  api.delete('/messages/:messageId', requireScope('write'), (req, res) => {
+  api.delete('/messages/:messageId', requireScope('write'), async (req, res) => {
     const permanent = req.query.permanent === 'true';
-    const ok = store.deleteMessage(req.params.messageId, permanent);
+    const ok = await store.deleteMessage(req.params.messageId, permanent);
     if (!ok) {
       res.status(404).json({ error: 'Message not found.' });
       return;
@@ -1237,7 +1238,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ deleted: true, permanent });
   });
 
-  api.post('/messages/bulk', requireScope('write'), (req, res) => {
+  api.post('/messages/bulk', requireScope('write'), async (req, res) => {
     const messageIds = Array.isArray(req.body?.messageIds)
       ? req.body.messageIds.filter((id: unknown): id is string => typeof id === 'string' && id.trim().length > 0)
       : [];
@@ -1254,7 +1255,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
 
     const permanent = Boolean(req.body?.permanent);
-    const result = store.bulkActionMessages(
+    const result = await store.bulkActionMessages(
       messageIds,
       action as 'markRead' | 'markUnread' | 'star' | 'unstar' | 'delete' | 'restore',
       { permanent },
@@ -1263,9 +1264,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // OTP Endpoint
-  api.get('/otp', requireScope('read'), (req, res) => {
+  api.get('/otp', requireScope('read'), async (req, res) => {
     const inboxParam = typeof req.query.inboxId === 'string' ? req.query.inboxId : undefined;
-    const resolvedInbox = inboxParam ? store.getInboxByIdOrAddress(inboxParam) : null;
+    const resolvedInbox = inboxParam ? await store.getInboxByIdOrAddress(inboxParam) : null;
     if (inboxParam && !resolvedInbox) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -1273,7 +1274,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
 
     const kind =
       req.query.kind === 'otp' || req.query.kind === 'links' ? req.query.kind : 'all';
-    const items = store.listOtpEntries({
+    const items = await store.listOtpEntries({
       inboxId: resolvedInbox?.id,
       query: typeof req.query.q === 'string' ? req.query.q : undefined,
       kind,
@@ -1283,32 +1284,32 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // Webhooks Management & Delivery Logs
-  api.get('/webhooks', requireScope('webhooks'), (req, res) => {
+  api.get('/webhooks', requireScope('webhooks'), async (req, res) => {
     const inboxId = typeof req.query.inboxId === 'string' ? req.query.inboxId : undefined;
-    res.json({ webhooks: store.listWebhooks(inboxId) });
+    res.json({ webhooks: await store.listWebhooks(inboxId) });
   });
 
-  api.post('/webhooks', requireScope('webhooks'), (req, res) => {
+  api.post('/webhooks', requireScope('webhooks'), async (req, res) => {
     try {
       const url = typeof req.body?.url === 'string' ? req.body.url : '';
       const inboxIdOrAddress =
         typeof req.body?.inboxId === 'string' ? req.body.inboxId : undefined;
       const events = Array.isArray(req.body?.events) ? (req.body.events as string[]) : undefined;
-      const created = store.createWebhook({ url, inboxIdOrAddress, events });
+      const created = await store.createWebhook({ url, inboxIdOrAddress, events });
       res.status(201).json(created);
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid webhook configuration.' });
     }
   });
 
-  api.patch('/webhooks/:id', requireScope('webhooks'), (req, res) => {
+  api.patch('/webhooks/:id', requireScope('webhooks'), async (req, res) => {
     const enabled = typeof req.body?.enabled === 'boolean' ? req.body.enabled : undefined;
     const events = Array.isArray(req.body?.events)
       ? (req.body.events as string[]).filter((e) =>
           ['email.received', 'otp.detected', 'inbox.created', '*'].includes(e),
         )
       : undefined;
-    const updated = store.updateWebhook(req.params.id, { enabled, events });
+    const updated = await store.updateWebhook(req.params.id, { enabled, events });
     if (!updated) {
       res.status(404).json({ error: 'Webhook not found.' });
       return;
@@ -1317,7 +1318,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   api.post('/webhooks/:id/test', requireScope('webhooks'), async (req, res) => {
-    const hook = store.getWebhookWithSecret(req.params.id);
+    const hook = await store.getWebhookWithSecret(req.params.id);
     if (!hook) {
       res.status(404).json({ error: 'Webhook not found.' });
       return;
@@ -1355,8 +1356,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.status(result.ok ? 200 : 502).json(result);
   });
 
-  api.delete('/webhooks/:id', requireScope('webhooks'), (req, res) => {
-    const ok = store.deleteWebhook(req.params.id);
+  api.delete('/webhooks/:id', requireScope('webhooks'), async (req, res) => {
+    const ok = await store.deleteWebhook(req.params.id);
     if (!ok) {
       res.status(404).json({ error: 'Webhook not found.' });
       return;
@@ -1364,9 +1365,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ deleted: true });
   });
 
-  api.get('/webhooks/deliveries', requireScope('webhooks'), (req, res) => {
+  api.get('/webhooks/deliveries', requireScope('webhooks'), async (req, res) => {
     const limit = Math.min(Number(req.query.limit ?? 50) || 50, 200);
-    res.json({ deliveries: store.listWebhookDeliveries(limit) });
+    res.json({ deliveries: await store.listWebhookDeliveries(limit) });
   });
 
   // SMTP Status & Real Connection Tester
@@ -1397,7 +1398,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     const port = Number(req.body?.port ?? smtpBridge.port ?? 2525);
     const secure = Boolean(req.body?.secure);
     const result = await testSmtpConnection({ host, port, secure });
-    store.recordActivity(
+    await store.recordActivity(
       'smtp:test',
       result.ok
         ? `SMTP connection verified (${host}:${port}, ${result.latencyMs}ms)`
@@ -1410,10 +1411,10 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // Activity Log (supports both /activities and /activity + export)
-  const handleQueryActivity = (req: Request, res: Response) => {
+  const handleQueryActivity = async (req: Request, res: Response) => {
     const limit = Math.min(Math.max(Number(req.query.limit ?? 50) || 50, 1), 200);
     const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
-    const result = store.queryActivities({
+    const result = await store.queryActivities({
       type: typeof req.query.type === 'string' ? req.query.type : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
       query: typeof req.query.q === 'string' ? req.query.q : undefined,
@@ -1428,9 +1429,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   api.get('/activities', requireScope('read'), handleQueryActivity);
   api.get('/activity', requireScope('read'), handleQueryActivity);
 
-  api.get('/activity/export', requireScope('read'), (req, res) => {
+  api.get('/activity/export', requireScope('read'), async (req, res) => {
     const format = req.query.format === 'csv' ? 'csv' : 'json';
-    const { activities } = store.queryActivities({ limit: 500 });
+    const { activities } = await store.queryActivities({ limit: 500 });
     if (format === 'csv') {
       const escapeCsv = (val: string) => `"${val.replace(/"/g, '""')}"`;
       const lines = ['id,timestamp,type,status,inboxAddress,summary,detail'];
@@ -1458,9 +1459,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   });
 
   // API Usage Logs
-  api.get('/usage', requireScope('read'), (req, res) => {
+  api.get('/usage', requireScope('read'), async (req, res) => {
     const limit = Math.min(Number(req.query.limit ?? 50) || 50, 200);
-    res.json({ usage: store.listApiUsageLogs(limit) });
+    res.json({ usage: await store.listApiUsageLogs(limit) });
   });
 
   // Real-time Server-Sent Events stream
@@ -1499,20 +1500,20 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   const adminApi = express.Router();
 
   const requireAdminSession = createAdminAuthMiddleware(store);
-  const issueAdminToken = () =>
-    issueAuthSession(store, { kind: 'admin', scopes: ['admin'] }).token;
+  const issueAdminToken = async () =>
+    (await issueAuthSession(store, { kind: 'admin', scopes: ['admin'] })).token;
 
-  adminApi.get('/status', (req, res) => {
+  adminApi.get('/status', async (req, res) => {
     const token = extractAdminToken(req);
     res.json({
-      configured: store.isAdminPasscodeConfigured(),
-      authenticated: isAdminTokenValid(store, token),
+      configured: await store.isAdminPasscodeConfigured(),
+      authenticated: await isAdminTokenValid(store, token),
       envManaged: store.hasEnvAdminPasscode(),
     });
   });
 
-  adminApi.post('/setup', (req, res) => {
-    const rl = store.database.consumeRateLimit(`rl:admin-setup:${req.ip || 'local'}`, 10);
+  adminApi.post('/setup', async (req, res) => {
+    const rl = await store.database.consumeRateLimit(`rl:admin-setup:${req.ip || 'local'}`, 10);
     if (!rl.allowed) {
       res.setHeader('Retry-After', String(rl.resetSec));
       res.status(429).json({ error: 'Too many setup attempts. Retry later.', code: 'RATE_LIMITED' });
@@ -1520,14 +1521,14 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
     const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode : '';
     try {
-      const claimed = store.claimInitialAdminPasscode(passcode);
+      const claimed = await store.claimInitialAdminPasscode(passcode);
       if (!claimed) {
         res.status(409).json({
           error: 'ระบบหลังบ้านถูกตั้งค่ารหัสผ่านไว้แล้ว กรุณาเข้าสู่ระบบด้วยรหัสผ่านเดิม',
         });
         return;
       }
-      const token = issueAdminToken();
+      const token = await issueAdminToken();
       res.status(201).json({
         token,
         status: {
@@ -1543,22 +1544,22 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
   });
 
-  adminApi.post('/login', (req, res) => {
-    const rl = store.database.consumeRateLimit(`rl:admin-login:${req.ip || 'local'}`, 15);
+  adminApi.post('/login', async (req, res) => {
+    const rl = await store.database.consumeRateLimit(`rl:admin-login:${req.ip || 'local'}`, 15);
     if (!rl.allowed) {
       res.setHeader('Retry-After', String(rl.resetSec));
       res.status(429).json({ error: 'ลองเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่', code: 'RATE_LIMITED' });
       return;
     }
-    if (!store.isAdminPasscodeConfigured()) {
+    if (!(await store.isAdminPasscodeConfigured())) {
       res.status(400).json({
         error: 'ยังไม่ได้ตั้งรหัสผ่านระบบหลังบ้าน กรุณาตั้งรหัสผ่านครั้งแรกก่อน',
       });
       return;
     }
     const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode : '';
-    if (!passcode || !store.verifyAdminPasscode(passcode)) {
-      store.recordActivity(
+    if (!passcode || !(await store.verifyAdminPasscode(passcode))) {
+      await store.recordActivity(
         'auth:failed',
         'Failed Admin Console login attempt',
         undefined,
@@ -1568,8 +1569,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
       res.status(401).json({ error: 'รหัสผ่านระบบหลังบ้านไม่ถูกต้อง' });
       return;
     }
-    const token = issueAdminToken();
-    store.recordActivity('auth:event', 'Admin Console login succeeded', undefined, undefined, 'info');
+    const token = await issueAdminToken();
+    await store.recordActivity('auth:event', 'Admin Console login succeeded', undefined, undefined, 'info');
     res.json({
       token,
       status: {
@@ -1580,9 +1581,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     });
   });
 
-  adminApi.post('/logout', (req, res) => {
+  adminApi.post('/logout', async (req, res) => {
     const token = extractAdminToken(req);
-    if (token) revokeAuthSession(store, token);
+    if (token) await revokeAuthSession(store, token);
     res.json({ ok: true });
   });
 
@@ -1590,7 +1591,7 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
 
   adminApi.get('/overview', async (_req, res) => {
     const liveMxDomains = await fetchLiveMxDomains().catch(() => []);
-    const overview = store.getAdminOverview({
+    const overview = await store.getAdminOverview({
       requireApiKey: requireApiKeyForExternal,
       smtpPort: smtpBridge.port,
       uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
@@ -1602,12 +1603,12 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     });
   });
 
-  adminApi.get('/inboxes', (req, res) => {
+  adminApi.get('/inboxes', async (req, res) => {
     const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
     const provider = typeof req.query.provider === 'string' ? req.query.provider : 'all';
     const status = typeof req.query.status === 'string' ? req.query.status : 'all';
 
-    let items = store.listInboxes();
+    let items = await store.listInboxes();
     if (provider !== 'all') {
       items = items.filter((i) => i.provider === provider);
     }
@@ -1625,9 +1626,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ inboxes: items, total: items.length });
   });
 
-  adminApi.patch('/inboxes/:idOrAddress', (req, res) => {
+  adminApi.patch('/inboxes/:idOrAddress', async (req, res) => {
     try {
-      const updated = store.updateInbox(req.params.idOrAddress, {
+      const updated = await store.updateInbox(req.params.idOrAddress, {
         label: typeof req.body?.label === 'string' ? req.body.label : undefined,
         status: typeof req.body?.status === 'string' ? req.body.status : undefined,
         webhookUrl:
@@ -1648,8 +1649,8 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     }
   });
 
-  adminApi.delete('/inboxes/:idOrAddress', (req, res) => {
-    const ok = store.deleteInbox(req.params.idOrAddress);
+  adminApi.delete('/inboxes/:idOrAddress', async (req, res) => {
+    const ok = await store.deleteInbox(req.params.idOrAddress);
     if (!ok) {
       res.status(404).json({ error: 'Inbox not found.' });
       return;
@@ -1657,9 +1658,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json({ deleted: true });
   });
 
-  adminApi.post('/maintenance/prune', (_req, res) => {
-    const result = store.runMaintenancePrune();
-    store.recordActivity(
+  adminApi.post('/maintenance/prune', async (_req, res) => {
+    const result = await store.runMaintenancePrune();
+    await store.recordActivity(
       'inbox:synced',
       `Admin maintenance prune completed (${result.expiredInboxes} expired, ${result.deletedMessages} old msgs)`,
       undefined,
@@ -1669,12 +1670,12 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     res.json(result);
   });
 
-  adminApi.post('/passcode', (req, res) => {
+  adminApi.post('/passcode', async (req, res) => {
     try {
       const currentPasscode =
         typeof req.body?.currentPasscode === 'string' ? req.body.currentPasscode : '';
       const newPasscode = typeof req.body?.newPasscode === 'string' ? req.body.newPasscode : '';
-      store.updateAdminPasscode(currentPasscode, newPasscode);
+      await store.updateAdminPasscode(currentPasscode, newPasscode);
       res.json({ ok: true });
     } catch (err) {
       res.status(400).json({
@@ -1686,18 +1687,18 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
   app.use('/api/admin', adminApi);
 
   async function initStarterAndBackground() {
-    if (!options.skipStarterInbox && store.listInboxes().length === 0) {
+    if (!options.skipStarterInbox && (await store.listInboxes()).length === 0) {
       try {
         const account = await provisionLiveMxAccount();
         const mx = await checkDomainMxRecords(account.domain).catch(() => null);
-        store.registerLiveMxInbox(account, {
+        await store.registerLiveMxInbox(account, {
           ttl: '24h',
           label: 'Primary Temp Inbox',
           mxVerified: mx?.mxVerified ?? true,
         });
       } catch {
-        if (store.listInboxes().length === 0) {
-          store.createInbox({
+        if ((await store.listInboxes()).length === 0) {
+          await store.createInbox({
             domain: WEBHOOK_DOMAINS[0],
             ttl: '24h',
             label: 'Primary Inbox',
@@ -1712,9 +1713,9 @@ export function createAppInstance(options: ServerInstanceOptions = {}) {
     store,
     smtpBridge,
     initStarterAndBackground,
-    close: () => {
+    close: async () => {
       smtpBridge.close();
-      store.database.db.close();
+      await store.database.close();
     },
   };
 }
@@ -1731,22 +1732,25 @@ async function startMainServer(): Promise<void> {
     return;
   }
 
-  const instance = createAppInstance();
+  const instance = await createAppInstance();
   await instance.initStarterAndBackground();
 
   const timers: ReturnType<typeof setInterval>[] = [];
   timers.push(
     setInterval(() => {
       if (instance.store.hasSubscribers()) {
-        void instance.store.syncAllLiveInboxes();
+        void instance.store.syncAllLiveInboxes().catch(() => undefined);
       }
     }, 12000),
   );
   timers.push(
     setInterval(() => {
-      instance.store.database.pruneRetention(instance.store.getRetentionDays());
-      instance.store.database.pruneExpiredSessions();
-      instance.store.database.pruneRateLimits();
+      void (async () => {
+        const retentionDays = await instance.store.getRetentionDays();
+        await instance.store.database.pruneRetention(retentionDays);
+        await instance.store.database.pruneExpiredSessions();
+        await instance.store.database.pruneRateLimits();
+      })().catch(() => undefined);
     }, 60 * 60 * 1000),
   );
 
@@ -1785,12 +1789,10 @@ async function startMainServer(): Promise<void> {
     console.log(`[shutdown] received ${signal}; closing server and database`);
     for (const timer of timers) clearInterval(timer);
     httpServer.close(() => {
-      instance.close();
-      process.exit(0);
+      void instance.close().then(() => process.exit(0));
     });
     setTimeout(() => {
-      instance.close();
-      process.exit(0);
+      void instance.close().then(() => process.exit(0));
     }, 10_000).unref();
   };
   process.once('SIGTERM', () => shutdown('SIGTERM'));

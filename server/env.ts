@@ -12,6 +12,12 @@ export function validateProductionEnv(env: NodeJS.ProcessEnv = process.env): Pro
     return { ok: true, errors, warnings };
   }
 
+  if (!(env.DATABASE_URL || '').trim()) {
+    errors.push('DATABASE_URL is required in production.');
+  }
+  if ((env.FLOWMAIL_DB_PATH || '').trim()) {
+    warnings.push('FLOWMAIL_DB_PATH is ignored in production when DATABASE_URL is set.');
+  }
   if ((env.RELAYBOX_ENCRYPTION_KEY || '').trim().length < 32) {
     errors.push('RELAYBOX_ENCRYPTION_KEY must be at least 32 characters in production.');
   }

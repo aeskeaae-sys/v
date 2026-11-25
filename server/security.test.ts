@@ -10,7 +10,7 @@ import { validateProductionEnv } from './env.ts';
 import type { ApiKeyScope } from '../shared/types.ts';
 
 async function startInstance(options: { dbPath?: string | null } = {}) {
-  const instance = createAppInstance({
+  const instance = await createAppInstance({
     dbPath: options.dbPath === undefined ? null : options.dbPath,
     legacyJsonPath: null,
     skipStarterInbox: true,
@@ -26,13 +26,16 @@ async function startInstance(options: { dbPath?: string | null } = {}) {
     baseUrl,
     close: async () => {
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-      instance.close();
+      await instance.close();
     },
   };
 }
 
-async function authenticatedToken(baseUrl: string, instance: ReturnType<typeof createAppInstance>) {
-  const { plaintextKey } = instance.store.createApiKey(
+async function authenticatedToken(
+  baseUrl: string,
+  instance: Awaited<ReturnType<typeof createAppInstance>>,
+) {
+  const { plaintextKey } = await instance.store.createApiKey(
     'security-test-bootstrap',
     ['read', 'write', 'webhooks', 'admin'] as ApiKeyScope[],
     2000,
@@ -113,7 +116,7 @@ test('security: expired sessions are rejected', async () => {
   const srv = await startInstance();
   try {
     const token = await authenticatedToken(srv.baseUrl, srv.instance);
-    srv.instance.store.database.db
+    await srv.instance.store.database.client
       .prepare('UPDATE auth_sessions SET expires_at = ? WHERE token_hash = ?')
       .run(new Date(Date.now() - 1000).toISOString(), hashSessionToken(token));
 
@@ -171,7 +174,7 @@ test('security: sessions and rate-limit counters are shared across instances on 
     });
     assert.equal(fromB.status, 200);
 
-    const key = a.instance.store.createApiKey('shared-rate-key', ['read'] as ApiKeyScope[], 10);
+    const key = await a.instance.store.createApiKey('shared-rate-key', ['read'] as ApiKeyScope[], 10);
     let lastStatus = 200;
     for (let i = 0; i < 11; i++) {
       const res = await fetch(`${b.baseUrl}/api/v1/inboxes`, {
@@ -190,6 +193,7 @@ test('security: sessions and rate-limit counters are shared across instances on 
 test('security: production environment validation blocks default secrets', () => {
   const valid = validateProductionEnv({
     NODE_ENV: 'production',
+    DATABASE_URL: 'postgres://user:pass@localhost:5432/relaybox',
     RELAYBOX_ENCRYPTION_KEY: 'x'.repeat(48),
     ADMIN_PASSCODE: 'strong-admin-passcode-2026',
     WEBHOOK_INBOUND_SECRET: 'webhook-secret-long-enough',

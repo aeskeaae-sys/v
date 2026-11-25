@@ -11,9 +11,9 @@ import { signWebhookPayload } from './crypto.ts';
 
 async function issueAuthenticatedSession(
   baseUrl: string,
-  instance: ReturnType<typeof createAppInstance>,
+  instance: Awaited<ReturnType<typeof createAppInstance>>,
 ): Promise<string> {
-  const { plaintextKey } = instance.store.createApiKey(
+  const { plaintextKey } = await instance.store.createApiKey(
     'integration-session-bootstrap',
     ['read', 'write', 'webhooks', 'admin'] as ApiKeyScope[],
     2000,
@@ -37,7 +37,7 @@ async function startTestServer(extraOpts: {
     process.env.WEBHOOK_INBOUND_SECRET = extraOpts.inboundSecret;
   }
 
-  const instance = createAppInstance({
+  const instance = await createAppInstance({
     dbPath: extraOpts.dbPath === undefined ? null : extraOpts.dbPath,
     legacyJsonPath: null,
     skipStarterInbox: true,
@@ -58,7 +58,7 @@ async function startTestServer(extraOpts: {
       if (prevSecret === undefined) delete process.env.WEBHOOK_INBOUND_SECRET;
       else process.env.WEBHOOK_INBOUND_SECRET = prevSecret;
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-      instance.close();
+      await instance.close();
     },
   };
 }

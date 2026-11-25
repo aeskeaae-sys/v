@@ -5,7 +5,7 @@ import { checkMigrations } from '../server/backup.ts';
 const dbPath = path.resolve(process.env.FLOWMAIL_DB_PATH || path.join('.data', 'mailbox.db'));
 
 try {
-  const report = checkMigrations(dbPath);
+  const report = await checkMigrations(dbPath);
   console.log(JSON.stringify(report, null, 2));
   if (report.integrity !== 'ok') throw new Error(`integrity_check=${report.integrity}`);
   if (report.version < 3 || report.count < 3) {

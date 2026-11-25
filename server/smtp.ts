@@ -135,7 +135,7 @@ export function startSmtpBridge(
 
     writeLine('220 relaybox.dev ESMTP RelayBox Inbound Bridge');
 
-    const processLine = (line: string) => {
+    const processLine = async (line: string) => {
       if (awaitingAuthLoginUser) {
         awaitingAuthLoginUser = false;
         awaitingAuthLoginPass = true;
@@ -164,7 +164,7 @@ export function startSmtpBridge(
           let deliveredCount = 0;
           for (const rcpt of rcptTo) {
             try {
-              store.ingestMessage({
+              await store.ingestMessage({
                 to: rcpt,
                 from: sender,
                 subject: parsed.subject,
@@ -288,19 +288,26 @@ export function startSmtpBridge(
       socket.destroy();
     });
 
+    let processing = Promise.resolve();
     socket.on('data', (chunk: string) => {
-      buffer += chunk;
-      if (!inData && Buffer.byteLength(buffer, 'utf8') > 65_536) {
-        writeLine('500 5.5.2 Command line too long');
-        socket.destroy();
-        return;
-      }
-      let idx: number;
-      while ((idx = buffer.indexOf('\n')) >= 0) {
-        const rawLine = buffer.slice(0, idx).replace(/\r$/, '');
-        buffer = buffer.slice(idx + 1);
-        processLine(rawLine);
-      }
+      processing = processing
+        .then(async () => {
+          buffer += chunk;
+          if (!inData && Buffer.byteLength(buffer, 'utf8') > 65_536) {
+            writeLine('500 5.5.2 Command line too long');
+            socket.destroy();
+            return;
+          }
+          let idx: number;
+          while ((idx = buffer.indexOf('\n')) >= 0) {
+            const rawLine = buffer.slice(0, idx).replace(/\r$/, '');
+            buffer = buffer.slice(idx + 1);
+            await processLine(rawLine);
+          }
+        })
+        .catch(() => {
+          writeLine('451 4.3.0 Internal server error');
+        });
     });
 
     socket.on('error', () => {

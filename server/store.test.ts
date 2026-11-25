@@ -2,18 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { FlowMailStore } from './store.ts';
 
-test('creates webhook inboxes, prevents duplicates, and keeps private credentials out of public views', () => {
+test('creates webhook inboxes, prevents duplicates, and keeps private credentials out of public views', async () => {
   const store = new FlowMailStore({ filePath: null });
-  const custom = store.createInbox({ prefix: 'signup-ops', domain: 'flowmail.cc', ttl: '1h' });
+  const custom = await store.createInbox({ prefix: 'signup-ops', domain: 'flowmail.cc', ttl: '1h' });
   assert.equal(custom.address, 'signup-ops@flowmail.cc');
   assert.equal(custom.mode, 'webhook');
   assert.ok(custom.expiresAt !== null);
 
-  assert.throws(() => {
-    store.createInbox({ prefix: 'signup-ops', domain: 'flowmail.cc' });
+  await assert.rejects(async () => {
+    await store.createInbox({ prefix: 'signup-ops', domain: 'flowmail.cc' });
   }, /already exists/);
 
-  const live = store.registerLiveMxInbox({
+  const live = await store.registerLiveMxInbox({
     address: 'live-123@euploading.com',
     localPart: 'live-123',
     domain: 'euploading.com',
@@ -26,11 +26,11 @@ test('creates webhook inboxes, prevents duplicates, and keeps private credential
   assert.equal('credentials' in live, false);
 });
 
-test('ingests messages, deduplicates by remoteId, updates read/starred state, and extracts OTPs', () => {
+test('ingests messages, deduplicates by remoteId, updates read/starred state, and extracts OTPs', async () => {
   const store = new FlowMailStore({ filePath: null });
-  const inbox = store.createInbox({ prefix: 'otp-check', domain: 'mail.flowmail.cc' });
+  const inbox = await store.createInbox({ prefix: 'otp-check', domain: 'mail.flowmail.cc' });
 
-  const msg = store.ingestMessage({
+  const msg = await store.ingestMessage({
     to: inbox.address,
     from: 'noreply@service.com',
     subject: 'Confirm login',
@@ -38,7 +38,7 @@ test('ingests messages, deduplicates by remoteId, updates read/starred state, an
     remoteId: 'rm_001',
   });
 
-  const duplicate = store.ingestMessage({
+  const duplicate = await store.ingestMessage({
     to: inbox.address,
     from: 'noreply@service.com',
     subject: 'Confirm login',
@@ -48,32 +48,32 @@ test('ingests messages, deduplicates by remoteId, updates read/starred state, an
 
   assert.equal(msg.id, duplicate.id);
   assert.equal(msg.extracted.primaryOtp, '609341');
-  assert.equal(store.getInboxByIdOrAddress(inbox.id)?.messageCount, 1);
-  assert.equal(store.getInboxByIdOrAddress(inbox.id)?.unreadCount, 1);
+  assert.equal((await store.getInboxByIdOrAddress(inbox.id))?.messageCount, 1);
+  assert.equal((await store.getInboxByIdOrAddress(inbox.id))?.unreadCount, 1);
 
-  store.updateMessage(msg.id, { read: true, starred: true });
-  assert.equal(store.getInboxByIdOrAddress(inbox.id)?.unreadCount, 0);
-  assert.equal(store.getMessage(msg.id)?.starred, true);
-  assert.equal(store.listMessages(inbox.id, { starredOnly: true }).length, 1);
+  await store.updateMessage(msg.id, { read: true, starred: true });
+  assert.equal((await store.getInboxByIdOrAddress(inbox.id))?.unreadCount, 0);
+  assert.equal((await store.getMessage(msg.id))?.starred, true);
+  assert.equal((await store.listMessages(inbox.id, { starredOnly: true })).length, 1);
 });
 
-test('autoCreateInbox provisions webhook inbox on first incoming message when enabled', () => {
+test('autoCreateInbox provisions webhook inbox on first incoming message when enabled', async () => {
   const store = new FlowMailStore({ filePath: null });
-  const msg = store.ingestMessage({
+  const msg = await store.ingestMessage({
     to: 'orders-77@flowmail.cc',
     subject: 'Order received',
     text: 'Thank you',
     autoCreateInbox: true,
   });
 
-  const inbox = store.getInboxByIdOrAddress('orders-77@flowmail.cc');
+  const inbox = await store.getInboxByIdOrAddress('orders-77@flowmail.cc');
   assert.ok(inbox);
   assert.equal(msg.inboxId, inbox.id);
 });
 
 test('waitForMessage resolves when matching message arrives', async () => {
   const store = new FlowMailStore({ filePath: null });
-  const inbox = store.createInbox({ prefix: 'wait-test', domain: 'flowmail.cc' });
+  const inbox = await store.createInbox({ prefix: 'wait-test', domain: 'flowmail.cc' });
 
   const waitPromise = store.waitForMessage(inbox.address, {
     timeoutMs: 2000,
@@ -81,16 +81,18 @@ test('waitForMessage resolves when matching message arrives', async () => {
   });
 
   setTimeout(() => {
-    store.ingestMessage({
-      to: inbox.address,
-      subject: 'Newsletter',
-      text: 'No code here',
-    });
-    store.ingestMessage({
-      to: inbox.address,
-      subject: 'Verify your account',
-      text: 'Code: 998811',
-    });
+    void (async () => {
+      await store.ingestMessage({
+        to: inbox.address,
+        subject: 'Newsletter',
+        text: 'No code here',
+      });
+      await store.ingestMessage({
+        to: inbox.address,
+        subject: 'Verify your account',
+        text: 'Code: 998811',
+      });
+    })().catch(() => undefined);
   }, 20);
 
   const matched = await waitPromise;
@@ -98,24 +100,24 @@ test('waitForMessage resolves when matching message arrives', async () => {
   assert.equal(matched.extracted.primaryOtp, '998811');
 });
 
-test('API keys are hashed on store and verified via timingSafeEqual', () => {
+test('API keys are hashed on store and verified via timingSafeEqual', async () => {
   const store = new FlowMailStore({ filePath: null });
-  const { summary, plaintextKey } = store.createApiKey('Automation Key');
+  const { summary, plaintextKey } = await store.createApiKey('Automation Key');
   assert.ok(plaintextKey.startsWith('fm_live_'));
-  assert.equal(store.listApiKeys().length, 1);
-  assert.equal(store.verifyApiKey(plaintextKey)?.id, summary.id);
-  assert.equal(store.verifyApiKey('fm_live_wrongkey'), null);
-  assert.equal(store.revokeApiKey(summary.id), true);
-  assert.equal(store.verifyApiKey(plaintextKey), null);
+  assert.equal((await store.listApiKeys()).length, 1);
+  assert.equal((await store.verifyApiKey(plaintextKey))?.id, summary.id);
+  assert.equal(await store.verifyApiKey('fm_live_wrongkey'), null);
+  assert.equal(await store.revokeApiKey(summary.id), true);
+  assert.equal(await store.verifyApiKey(plaintextKey), null);
 });
 
-test('supports folders (inbox, sent, drafts, spam, trash), internal delivery, and restore/permanent delete', () => {
+test('supports folders (inbox, sent, drafts, spam, trash), internal delivery, and restore/permanent delete', async () => {
   const store = new FlowMailStore({ filePath: null });
-  const sender = store.createInbox({ prefix: 'alice', domain: 'relaybox.dev' });
-  const receiver = store.createInbox({ prefix: 'bob', domain: 'relaybox.dev' });
+  const sender = await store.createInbox({ prefix: 'alice', domain: 'relaybox.dev' });
+  const receiver = await store.createInbox({ prefix: 'bob', domain: 'relaybox.dev' });
 
   // Internal send creates sent copy for sender AND delivers into receiver's inbox!
-  const sentMsg = store.saveDraftOrSentMessage({
+  const sentMsg = await store.saveDraftOrSentMessage({
     inboxIdOrAddress: sender.id,
     to: receiver.address,
     subject: 'Internal Ping',
@@ -123,21 +125,21 @@ test('supports folders (inbox, sent, drafts, spam, trash), internal delivery, an
     mode: 'sent',
   });
   assert.equal(sentMsg.folder, 'sent');
-  assert.equal(store.listMessages(receiver.id, { folder: 'inbox' }).length, 1);
-  assert.equal(store.listMessages(receiver.id, { folder: 'inbox' })[0].extracted.primaryOtp, '135790');
+  assert.equal((await store.listMessages(receiver.id, { folder: 'inbox' })).length, 1);
+  assert.equal((await store.listMessages(receiver.id, { folder: 'inbox' }))[0].extracted.primaryOtp, '135790');
 
   // Soft-delete moves to trash, restore returns to inbox, permanent delete removes row
-  const receiverMsg = store.listMessages(receiver.id, { folder: 'inbox' })[0];
-  assert.equal(store.deleteMessage(receiverMsg.id, false), true);
-  assert.equal(store.getMessage(receiverMsg.id)?.folder, 'trash');
-  store.updateMessage(receiverMsg.id, { folder: 'inbox' });
-  assert.equal(store.getMessage(receiverMsg.id)?.folder, 'inbox');
-  assert.equal(store.deleteMessage(receiverMsg.id, true), true);
-  assert.equal(store.getMessage(receiverMsg.id), null);
+  const receiverMsg = (await store.listMessages(receiver.id, { folder: 'inbox' }))[0];
+  assert.equal(await store.deleteMessage(receiverMsg.id, false), true);
+  assert.equal((await store.getMessage(receiverMsg.id))?.folder, 'trash');
+  await store.updateMessage(receiverMsg.id, { folder: 'inbox' });
+  assert.equal((await store.getMessage(receiverMsg.id))?.folder, 'inbox');
+  assert.equal(await store.deleteMessage(receiverMsg.id, true), true);
+  assert.equal(await store.getMessage(receiverMsg.id), null);
 
   // Executable attachment is blocked at ingestion
-  assert.throws(() => {
-    store.ingestMessage({
+  await assert.rejects(async () => {
+    await store.ingestMessage({
       to: receiver.address,
       subject: 'Executable test',
       text: 'See attached',
@@ -146,7 +148,7 @@ test('supports folders (inbox, sent, drafts, spam, trash), internal delivery, an
   }, /Executable attachment/);
 
   // Spam routing without executable attachment
-  const spamMsg = store.ingestMessage({
+  const spamMsg = await store.ingestMessage({
     to: receiver.address,
     from: 'winner@scam.invalid',
     subject: 'URGENT: Claim $1,000,000 crypto lottery prize! Verify your bank account now!',
@@ -161,7 +163,7 @@ test('supports folders (inbox, sent, drafts, spam, trash), internal delivery, an
 test('surfaces Mail.tm 429 rate limits and applies store sync cooldown without marking inbox broken', async (t) => {
   const { MailTmRateLimitError, fetchNewLiveMxMessages } = await import('./mailtm.ts');
   const store = new FlowMailStore({ filePath: null });
-  const live = store.registerLiveMxInbox({
+  const live = await store.registerLiveMxInbox({
     address: 'rate-test@euploading.com',
     localPart: 'rate-test',
     domain: 'euploading.com',
@@ -198,7 +200,7 @@ test('surfaces Mail.tm 429 rate limits and applies store sync cooldown without m
     () => store.syncLiveInbox(live.id, { force: true }),
     (err: unknown) => err instanceof MailTmRateLimitError,
   );
-  const afterRateLimit = store.getInboxByIdOrAddress(live.id);
+  const afterRateLimit = await store.getInboxByIdOrAddress(live.id);
   assert.equal(afterRateLimit?.status, 'active');
   assert.ok(afterRateLimit?.syncError?.includes('429'));
 
@@ -209,10 +211,10 @@ test('surfaces Mail.tm 429 rate limits and applies store sync cooldown without m
   assert.equal(fetchCalls, callsBeforeCooldownSync);
 });
 
-test('creates Gmail and Outlook aliases, prevents invalid domain mismatches, and marks synced', () => {
+test('creates Gmail and Outlook aliases, prevents invalid domain mismatches, and marks synced', async () => {
   const store = new FlowMailStore({ filePath: null });
 
-  const gmailPlus = store.createAliasInbox({
+  const gmailPlus = await store.createAliasInbox({
     baseEmail: 'somwang@gmail.com',
     provider: 'gmail-alias',
     strategy: 'plus',
@@ -222,7 +224,7 @@ test('creates Gmail and Outlook aliases, prevents invalid domain mismatches, and
   assert.equal(gmailPlus.mode, 'alias');
   assert.equal(gmailPlus.provider, 'gmail-alias');
 
-  const gmailDot = store.createAliasInbox({
+  const gmailDot = await store.createAliasInbox({
     baseEmail: 'somwang@gmail.com',
     provider: 'gmail-alias',
     strategy: 'dot',
@@ -230,75 +232,76 @@ test('creates Gmail and Outlook aliases, prevents invalid domain mismatches, and
   assert.equal(gmailDot.address, 's.omwang@gmail.com');
   assert.equal(gmailDot.provider, 'gmail-alias');
 
-  const outlookPlus = store.createAliasInbox({
+  const outlookPlus = await store.createAliasInbox({
     baseEmail: 'myuser@outlook.com',
     provider: 'outlook-alias',
+    strategy: 'plus',
     tag: 'netflix',
   });
   assert.equal(outlookPlus.address, 'myuser+netflix@outlook.com');
   assert.equal(outlookPlus.mode, 'alias');
   assert.equal(outlookPlus.provider, 'outlook-alias');
 
-  assert.throws(() => {
-    store.createAliasInbox({
+  await assert.rejects(async () => {
+    await store.createAliasInbox({
       baseEmail: 'somwang@gmail.com',
       provider: 'outlook-alias',
     });
   }, /Outlook Alias/);
 
-  assert.throws(() => {
-    store.createAliasInbox({
+  await assert.rejects(async () => {
+    await store.createAliasInbox({
       baseEmail: 'myuser@hotmail.com',
       provider: 'gmail-alias',
     });
   }, /Outlook\/Hotmail/);
 
-  const synced = store.markInboxSynced(gmailPlus.id, 2);
+  const synced = await store.markInboxSynced(gmailPlus.id, 2);
   assert.ok(synced?.lastSyncedAt);
 
   // Optional baseEmail generates clean random Gmail/Outlook addresses
-  const autoGmail = store.createAliasInbox({
+  const autoGmail = await store.createAliasInbox({
     provider: 'gmail-alias',
     tag: 'promo',
   });
   assert.match(autoGmail.address, /^rb[0-9a-f]+\+promo@gmail\.com$/);
   assert.equal(autoGmail.provider, 'gmail-alias');
 
-  const autoGmailDot = store.createAliasInbox({
+  const autoGmailDot = await store.createAliasInbox({
     provider: 'gmail-alias',
     strategy: 'dot',
   });
   assert.match(autoGmailDot.address, /^r\.?[0-9a-z.]+@gmail\.com$/);
 
-  const autoOutlook = store.createAliasInbox({
+  const autoOutlook = await store.createAliasInbox({
     provider: 'outlook-alias',
   });
   assert.match(autoOutlook.address, /^rb[0-9a-f]+@outlook\.com$/);
   assert.equal(autoOutlook.provider, 'outlook-alias');
 });
 
-test('handles atomic first-run admin passcode setup, scrypt verification, update, and overview stats', () => {
+test('handles atomic first-run admin passcode setup, scrypt verification, update, and overview stats', async () => {
   const store = new FlowMailStore({ filePath: null });
-  assert.equal(store.isAdminPasscodeConfigured(), false);
+  assert.equal(await store.isAdminPasscodeConfigured(), false);
 
-  assert.equal(store.claimInitialAdminPasscode('secret-admin-99'), true);
-  assert.equal(store.isAdminPasscodeConfigured(), true);
+  assert.equal(await store.claimInitialAdminPasscode('secret-admin-99'), true);
+  assert.equal(await store.isAdminPasscodeConfigured(), true);
   // Second claim must fail atomically
-  assert.equal(store.claimInitialAdminPasscode('attacker-pass'), false);
+  assert.equal(await store.claimInitialAdminPasscode('attacker-pass'), false);
 
-  assert.equal(store.verifyAdminPasscode('secret-admin-99'), true);
-  assert.equal(store.verifyAdminPasscode('wrong-pass'), false);
+  assert.equal(await store.verifyAdminPasscode('secret-admin-99'), true);
+  assert.equal(await store.verifyAdminPasscode('wrong-pass'), false);
 
-  store.updateAdminPasscode('secret-admin-99', 'new-admin-2026');
-  assert.equal(store.verifyAdminPasscode('new-admin-2026'), true);
-  assert.equal(store.verifyAdminPasscode('secret-admin-99'), false);
+  await store.updateAdminPasscode('secret-admin-99', 'new-admin-2026');
+  assert.equal(await store.verifyAdminPasscode('new-admin-2026'), true);
+  assert.equal(await store.verifyAdminPasscode('secret-admin-99'), false);
 
-  store.createAliasInbox({
+  await store.createAliasInbox({
     baseEmail: 'demo@gmail.com',
     provider: 'gmail-alias',
     tag: 'test1',
   });
-  const overview = store.getAdminOverview({
+  const overview = await store.getAdminOverview({
     requireApiKey: false,
     smtpPort: 2525,
     uptimeSeconds: 42,
@@ -307,73 +310,73 @@ test('handles atomic first-run admin passcode setup, scrypt verification, update
   assert.equal(overview.byProvider['gmail-alias'], 1);
 });
 
-test('bulkActionMessages marks read/unread, stars/unstars, moves to trash, restores, and permanently deletes', () => {
+test('bulkActionMessages marks read/unread, stars/unstars, moves to trash, restores, and permanently deletes', async () => {
   const store = new FlowMailStore({ filePath: null });
-  const inbox = store.createInbox({ prefix: 'bulk-ops', domain: 'relaybox.dev' });
+  const inbox = await store.createInbox({ prefix: 'bulk-ops', domain: 'relaybox.dev' });
 
-  const m1 = store.ingestMessage({ to: inbox.address, subject: 'One', text: '1' });
-  const m2 = store.ingestMessage({ to: inbox.address, subject: 'Two', text: '2' });
-  const m3 = store.ingestMessage({ to: inbox.address, subject: 'Three', text: '3' });
+  const m1 = await store.ingestMessage({ to: inbox.address, subject: 'One', text: '1' });
+  const m2 = await store.ingestMessage({ to: inbox.address, subject: 'Two', text: '2' });
+  const m3 = await store.ingestMessage({ to: inbox.address, subject: 'Three', text: '3' });
 
-  const readRes = store.bulkActionMessages([m1.id, m2.id], 'markRead');
+  const readRes = await store.bulkActionMessages([m1.id, m2.id], 'markRead');
   assert.equal(readRes.affected, 2);
-  assert.equal(store.getInboxByIdOrAddress(inbox.id)?.unreadCount, 1);
+  assert.equal((await store.getInboxByIdOrAddress(inbox.id))?.unreadCount, 1);
 
-  const starRes = store.bulkActionMessages([m1.id, m3.id], 'star');
+  const starRes = await store.bulkActionMessages([m1.id, m3.id], 'star');
   assert.equal(starRes.affected, 2);
-  assert.equal(store.getMessage(m1.id)?.starred, true);
-  assert.equal(store.getMessage(m3.id)?.starred, true);
+  assert.equal((await store.getMessage(m1.id))?.starred, true);
+  assert.equal((await store.getMessage(m3.id))?.starred, true);
 
-  const unstarRes = store.bulkActionMessages([m1.id], 'unstar');
+  const unstarRes = await store.bulkActionMessages([m1.id], 'unstar');
   assert.equal(unstarRes.affected, 1);
-  assert.equal(store.getMessage(m1.id)?.starred, false);
+  assert.equal((await store.getMessage(m1.id))?.starred, false);
 
-  const unreadRes = store.bulkActionMessages([m1.id], 'markUnread');
+  const unreadRes = await store.bulkActionMessages([m1.id], 'markUnread');
   assert.equal(unreadRes.affected, 1);
-  assert.equal(store.getInboxByIdOrAddress(inbox.id)?.unreadCount, 2);
+  assert.equal((await store.getInboxByIdOrAddress(inbox.id))?.unreadCount, 2);
 
   // Soft delete moves to trash
-  const trashRes = store.bulkActionMessages([m1.id, m2.id], 'delete');
+  const trashRes = await store.bulkActionMessages([m1.id, m2.id], 'delete');
   assert.equal(trashRes.affected, 2);
   assert.equal(trashRes.deletedIds.length, 0);
-  assert.equal(store.getMessage(m1.id)?.folder, 'trash');
-  assert.equal(store.getMessage(m2.id)?.folder, 'trash');
+  assert.equal((await store.getMessage(m1.id))?.folder, 'trash');
+  assert.equal((await store.getMessage(m2.id))?.folder, 'trash');
 
   // Restore moves back to inbox
-  const restoreRes = store.bulkActionMessages([m1.id], 'restore');
+  const restoreRes = await store.bulkActionMessages([m1.id], 'restore');
   assert.equal(restoreRes.affected, 1);
-  assert.equal(store.getMessage(m1.id)?.folder, 'inbox');
+  assert.equal((await store.getMessage(m1.id))?.folder, 'inbox');
 
   // Deleting items already in trash permanently removes them
-  const permRes = store.bulkActionMessages([m2.id], 'delete');
+  const permRes = await store.bulkActionMessages([m2.id], 'delete');
   assert.equal(permRes.affected, 1);
   assert.deepEqual(permRes.deletedIds, [m2.id]);
-  assert.equal(store.getMessage(m2.id), null);
+  assert.equal(await store.getMessage(m2.id), null);
 });
 
-test('deliverCredentialsEmail delivers per-inbox password email for Webhook, Alias, and Live MX inboxes', () => {
+test('deliverCredentialsEmail delivers per-inbox password email for Webhook, Alias, and Live MX inboxes', async () => {
   const store = new FlowMailStore({ filePath: null });
 
-  const webhookInbox = store.createInbox({
+  const webhookInbox = await store.createInbox({
     prefix: 'cred-hook',
     domain: 'relaybox.dev',
     deliverCredentialsEmail: true,
   });
   assert.equal(webhookInbox.messageCount, 1);
-  const hookMsgs = store.listMessages(webhookInbox.id, { folder: 'inbox' });
+  const hookMsgs = await store.listMessages(webhookInbox.id, { folder: 'inbox' });
   assert.equal(hookMsgs.length, 1);
   assert.ok(hookMsgs[0].text.includes('รหัสผ่าน: Rb_'));
   assert.equal(hookMsgs[0].extracted.otpCodes.length, 0);
 
-  const aliasInbox = store.createAliasInbox({
+  const aliasInbox = await store.createAliasInbox({
     provider: 'gmail-alias',
     deliverCredentialsEmail: true,
   });
   assert.equal(aliasInbox.messageCount, 1);
-  const aliasMsgs = store.listMessages(aliasInbox.id, { folder: 'inbox' });
+  const aliasMsgs = await store.listMessages(aliasInbox.id, { folder: 'inbox' });
   assert.ok(aliasMsgs[0].text.includes('รหัสผ่าน: Rb_'));
 
-  const liveInbox = store.registerLiveMxInbox(
+  const liveInbox = await store.registerLiveMxInbox(
     {
       address: 'live-cred@euploading.com',
       localPart: 'live-cred',
@@ -385,6 +388,6 @@ test('deliverCredentialsEmail delivers per-inbox password email for Webhook, Ali
     { deliverCredentialsEmail: true },
   );
   assert.equal(liveInbox.messageCount, 1);
-  const liveMsgs = store.listMessages(liveInbox.id, { folder: 'inbox' });
+  const liveMsgs = await store.listMessages(liveInbox.id, { folder: 'inbox' });
   assert.ok(liveMsgs[0].text.includes('Fm_liveSecretPass99'));
 });

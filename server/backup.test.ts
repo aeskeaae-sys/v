@@ -6,7 +6,7 @@ import path from 'node:path';
 import { checkMigrations, createBackup, restoreBackup } from './backup.ts';
 import { MailboxDatabase } from './db.ts';
 
-test('SQLite backup, migration check, and restore preserve row counts and integrity', () => {
+test('SQLite backup, migration check, and restore preserve row counts and integrity', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybox-backup-'));
   const dbPath = path.join(dir, 'live.db');
   const backupPath = path.join(dir, 'backups', 'live.db');
@@ -14,29 +14,29 @@ test('SQLite backup, migration check, and restore preserve row counts and integr
 
   const db = new MailboxDatabase({ dbPath });
   try {
-    db.enqueueJob({
+    await db.enqueueJob({
       id: 'backup-job',
       type: 'webhook.retry',
       payload: { eventId: 'evt_backup' },
     });
   } finally {
-    db.close();
+    await db.close();
   }
 
-  const backup = createBackup(dbPath, backupPath);
+  const backup = await createBackup(dbPath, backupPath);
   assert.equal(backup.integrity, 'ok');
   assert.equal(backup.counts.job_queue, 1);
 
-  const migration = checkMigrations(backupPath);
+  const migration = await checkMigrations(backupPath);
   assert.equal(migration.integrity, 'ok');
   assert.ok(migration.version >= 3);
   assert.ok(migration.count >= 3);
 
-  const restored = restoreBackup(backupPath, targetPath);
+  const restored = await restoreBackup(backupPath, targetPath);
   assert.equal(restored.integrity, 'ok');
-  assert.equal(checkMigrations(targetPath).counts.job_queue, 1);
+  assert.equal((await checkMigrations(targetPath)).counts.job_queue, 1);
 
-  assert.throws(() => createBackup(dbPath, dbPath), /must differ/);
-  assert.throws(() => restoreBackup(backupPath, backupPath), /must differ/);
+  await assert.rejects(() => createBackup(dbPath, dbPath), /must differ/);
+  await assert.rejects(() => restoreBackup(backupPath, backupPath), /must differ/);
   fs.rmSync(dir, { recursive: true, force: true });
 });

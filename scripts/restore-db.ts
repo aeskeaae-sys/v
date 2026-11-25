@@ -6,7 +6,11 @@ const backupPath = process.argv[2];
 const confirmed = process.argv.includes('--confirm');
 
 if (!backupPath) {
-  console.error('[restore] usage: npm run restore -- <backup.db> --confirm');
+  console.error(
+    process.env.DATABASE_URL
+      ? '[restore] usage: npm run restore -- <backup.json> --confirm'
+      : '[restore] usage: npm run restore -- <backup.db> --confirm',
+  );
   process.exit(1);
 }
 
@@ -21,7 +25,7 @@ const targetPath = path.resolve(
 );
 
 try {
-  const report = restoreBackup(backupPath, targetPath);
+  const report = await restoreBackup(backupPath, targetPath);
   console.log(JSON.stringify(report, null, 2));
 } catch (err) {
   console.error(`[restore] ${err instanceof Error ? err.message : String(err)}`);
