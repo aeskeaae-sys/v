@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: flowmail-api
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: sh docker-entrypoint.sh
+    healthCheckPath: /api/health
+    disk:
+      name: flowmail-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: NODE_VERSION
+        value: "22.22.0"
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+      - key: FLOWMAIL_DB_PATH
+        value: /data/mailbox.db
+      - key: REQUIRE_API_KEY
+        value: "true"
+      - key: RELAYBOX_ENCRYPTION_KEY
+        generateValue: true
+      - key: ADMIN_PASSCODE
+        generateValue: true
+      - key: WEBHOOK_INBOUND_SECRET
+        generateValue: true
