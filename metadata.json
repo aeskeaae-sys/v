@@ -1,0 +1,6 @@
+{
+  "name": "FlowMail",
+  "description": "Disposable temporary email addresses and automated QA testing API with real-time inbox streaming, OTP extraction, and webhook ingestion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

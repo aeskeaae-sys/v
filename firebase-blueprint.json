@@ -1,0 +1,234 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Publicly non-sensitive profile record for an authenticated RelayBox user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "photoUrl": {
+          "type": "string",
+          "description": "Avatar URL",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "User Private Info",
+      "description": "Isolated PII record containing the authenticated user's email address.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified account email address",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": ["uid", "email", "updatedAt"]
+    },
+    "SavedInbox": {
+      "title": "Saved Mailbox",
+      "description": "Cloud-synced disposable mailbox metadata belonging to an authenticated user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique mailbox identifier",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "address": {
+          "type": "string",
+          "format": "email",
+          "description": "Disposable email address",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["live-mx", "webhook", "alias"],
+          "description": "Inbox delivery mode",
+          "maxLength": 20
+        },
+        "provider": {
+          "type": "string",
+          "enum": ["mail.tm", "webhook", "smtp", "gmail-alias", "outlook-alias"],
+          "description": "Provisioning provider",
+          "maxLength": 20
+        },
+        "label": {
+          "type": "string",
+          "description": "User label for the mailbox",
+          "maxLength": 120
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "paused", "error", "expired"],
+          "description": "Current mailbox status",
+          "maxLength": 20
+        },
+        "messageCount": {
+          "type": "integer",
+          "description": "Total received message count"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "address",
+        "mode",
+        "provider",
+        "label",
+        "status",
+        "messageCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SavedOtp": {
+      "title": "Saved OTP Record",
+      "description": "Cloud-synced verification OTP or magic link extracted for an owned mailbox.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique OTP record identifier",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inboxId": {
+          "type": "string",
+          "description": "Parent savedInbox document ID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inboxAddress": {
+          "type": "string",
+          "format": "email",
+          "description": "Recipient disposable address",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "code": {
+          "type": "string",
+          "description": "Extracted OTP code or token summary",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "subject": {
+          "type": "string",
+          "description": "Email subject line",
+          "maxLength": 200
+        },
+        "sender": {
+          "type": "string",
+          "description": "Sender address or display name",
+          "minLength": 1,
+          "maxLength": 254
+        },
+        "actionUrl": {
+          "type": "string",
+          "description": "Optional extracted verification URL",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "inboxId",
+        "inboxAddress",
+        "code",
+        "subject",
+        "sender",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Authenticated user profile documents (non-PII fields only)."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Isolated PII subcollection storing user email under private/info."
+    },
+    "/users/{userId}/savedInboxes/{inboxId}": {
+      "schema": { "$ref": "#/entities/SavedInbox" },
+      "description": "Per-user cloud-synced disposable mailbox metadata."
+    },
+    "/users/{userId}/savedOtps/{otpId}": {
+      "schema": { "$ref": "#/entities/SavedOtp" },
+      "description": "Per-user cloud-synced OTP codes and verification links linked to savedInboxes."
+    }
+  }
+}

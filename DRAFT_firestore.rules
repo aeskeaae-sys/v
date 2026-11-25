@@ -1,0 +1,233 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Entity Validation Blueprints
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'photoUrl', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.uid == request.auth.uid
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 100
+        && (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.uid == request.auth.uid
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 254
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSavedInbox(data, userId, inboxId) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'address', 'mode', 'provider', 'label', 'status', 'messageCount', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'address', 'mode', 'provider', 'label', 'status', 'messageCount', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.id == inboxId
+        && isValidId(data.ownerUid)
+        && data.ownerUid == userId
+        && data.ownerUid == request.auth.uid
+        && data.address is string
+        && data.address.size() >= 3
+        && data.address.size() <= 254
+        && data.mode is string
+        && data.mode.size() <= 20
+        && (data.mode == 'live-mx' || data.mode == 'webhook' || data.mode == 'alias')
+        && data.provider is string
+        && data.provider.size() <= 20
+        && (data.provider == 'mail.tm' || data.provider == 'webhook' || data.provider == 'smtp' || data.provider == 'gmail-alias' || data.provider == 'outlook-alias')
+        && data.label is string
+        && data.label.size() <= 120
+        && data.status is string
+        && data.status.size() <= 20
+        && (data.status == 'active' || data.status == 'paused' || data.status == 'error' || data.status == 'expired')
+        && data.messageCount is int
+        && data.messageCount >= 0
+        && data.messageCount <= 1000000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSavedOtp(data, userId, otpId) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'inboxId', 'inboxAddress', 'code', 'subject', 'sender', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'inboxId', 'inboxAddress', 'code', 'subject', 'sender', 'actionUrl', 'createdAt'
+        ])
+        && isValidId(data.id)
+        && data.id == otpId
+        && isValidId(data.ownerUid)
+        && data.ownerUid == userId
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.inboxId)
+        && data.inboxAddress is string
+        && data.inboxAddress.size() >= 3
+        && data.inboxAddress.size() <= 254
+        && data.code is string
+        && data.code.size() >= 1
+        && data.code.size() <= 32
+        && data.subject is string
+        && data.subject.size() <= 200
+        && data.sender is string
+        && data.sender.size() >= 1
+        && data.sender.size() <= 254
+        && (!('actionUrl' in data) || (data.actionUrl is string && data.actionUrl.size() <= 1000))
+        && data.createdAt is timestamp;
+    }
+
+    // User Profiles (non-PII only)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoUrl', 'updatedAt']);
+      allow delete: if isValidId(userId) && isOwner(userId);
+
+      // Isolated PII subcollection
+      match /private/{docId} {
+        allow get: if isValidId(userId) && docId == 'info' && isOwner(userId);
+        allow list: if false;
+        allow create: if isValidId(userId)
+          && docId == 'info'
+          && isOwner(userId)
+          && isValidUserPrivateInfo(incoming(), userId)
+          && incoming().updatedAt == request.time
+          && (
+            exists(/databases/$(database)/documents/users/$(userId))
+            || existsAfter(/databases/$(database)/documents/users/$(userId))
+          );
+        allow update: if isValidId(userId)
+          && docId == 'info'
+          && isOwner(userId)
+          && isValidUserPrivateInfo(incoming(), userId)
+          && incoming().uid == existing().uid
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt'])
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow delete: if isValidId(userId) && docId == 'info' && isOwner(userId);
+      }
+
+      // Per-user cloud-synced mailboxes
+      match /savedInboxes/{inboxId} {
+        allow get: if isValidId(userId)
+          && isValidId(inboxId)
+          && isOwner(userId)
+          && existing().ownerUid == request.auth.uid;
+        allow list: if isValidId(userId)
+          && isOwner(userId)
+          && existing().ownerUid == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(inboxId)
+          && isOwner(userId)
+          && isValidSavedInbox(incoming(), userId, inboxId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            exists(/databases/$(database)/documents/users/$(userId))
+            || existsAfter(/databases/$(database)/documents/users/$(userId))
+          );
+        allow update: if isValidId(userId)
+          && isValidId(inboxId)
+          && isOwner(userId)
+          && isValidSavedInbox(incoming(), userId, inboxId)
+          && incoming().id == existing().id
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().address == existing().address
+          && incoming().mode == existing().mode
+          && incoming().provider == existing().provider
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['label', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['status', 'messageCount', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['label', 'status', 'messageCount', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId)
+          && isValidId(inboxId)
+          && isOwner(userId)
+          && existing().ownerUid == request.auth.uid;
+      }
+
+      // Per-user cloud-synced OTP records
+      match /savedOtps/{otpId} {
+        allow get: if isValidId(userId)
+          && isValidId(otpId)
+          && isOwner(userId)
+          && existing().ownerUid == request.auth.uid;
+        allow list: if isValidId(userId)
+          && isOwner(userId)
+          && existing().ownerUid == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(otpId)
+          && isOwner(userId)
+          && isValidSavedOtp(incoming(), userId, otpId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (
+            exists(/databases/$(database)/documents/users/$(userId)/savedInboxes/$(incoming().inboxId))
+            || existsAfter(/databases/$(database)/documents/users/$(userId)/savedInboxes/$(incoming().inboxId))
+          );
+        allow update: if false;
+        allow delete: if isValidId(userId)
+          && isValidId(otpId)
+          && isOwner(userId)
+          && existing().ownerUid == request.auth.uid;
+      }
+    }
+  }
+}
