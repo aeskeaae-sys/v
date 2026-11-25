@@ -294,29 +294,43 @@ export class MailboxDatabase {
   }
 
   private async runMigrations(): Promise<void> {
-    await this.client.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TEXT NOT NULL
-      );
-    `);
+    const migrationLockKey = 424242424242;
+    const useAdvisoryLock = this.client.kind === 'postgres';
+    if (useAdvisoryLock) {
+      await this.client.prepare('SELECT pg_advisory_lock(?)').get(migrationLockKey);
+    }
+    try {
+      await this.client.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
 
-    const appliedRows = await this.client.prepare('SELECT version FROM schema_migrations').all();
-    const applied = new Set(appliedRows.map((r) => Number(r.version)));
+      const appliedRows = await this.client.prepare('SELECT version FROM schema_migrations').all();
+      const applied = new Set(appliedRows.map((r) => Number(r.version)));
 
-    for (const m of MIGRATIONS) {
-      if (applied.has(m.version)) continue;
-      await this.client.exec('BEGIN');
-      try {
-        await this.client.exec(m.sql);
-        await this.client
-          .prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
-          .run(m.version, m.name, new Date().toISOString());
-        await this.client.exec('COMMIT');
-      } catch (err) {
-        await this.client.exec('ROLLBACK');
-        throw err;
+      for (const m of MIGRATIONS) {
+        if (applied.has(m.version)) continue;
+        await this.client.exec('BEGIN');
+        try {
+          await this.client.exec(m.sql);
+          await this.client
+            .prepare(
+              `INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)
+               ON CONFLICT(version) DO NOTHING`,
+            )
+            .run(m.version, m.name, new Date().toISOString());
+          await this.client.exec('COMMIT');
+        } catch (err) {
+          await this.client.exec('ROLLBACK');
+          throw err;
+        }
+      }
+    } finally {
+      if (useAdvisoryLock) {
+        await this.client.prepare('SELECT pg_advisory_unlock(?)').get(migrationLockKey);
       }
     }
   }
